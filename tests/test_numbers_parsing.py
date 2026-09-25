@@ -69,3 +69,107 @@ def test_parse_decimal_strict_mode():
     assert str(numbers.parse_decimal('2580', locale='en_US', strict=True)) == '2580'
     # High precision numbers should be accepted
     assert str(numbers.parse_decimal('5,000001', locale='fr', strict=True)) == '5.000001'
+
+
+def test_parse_currency_us_format():
+    amount, currency = numbers.parse_currency(
+        '$1,234.50', locale='en_US', allowed_currencies={'USD'},
+    )
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'USD'
+    # Currency codes are recognized as well as symbols
+    amount, currency = numbers.parse_currency('USD 1,234.50', locale='en_US')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'USD'
+
+
+def test_parse_currency_german_format():
+    amount, currency = numbers.parse_currency('1.234,50 €', locale='de_DE')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'EUR'
+    amount, currency = numbers.parse_currency('1.234,50 EUR', locale='de_DE')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'EUR'
+
+
+def test_parse_currency_french_format():
+    amount, currency = numbers.parse_currency('1 234,50 €', locale='fr_FR')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'EUR'
+
+
+def test_parse_currency_negative():
+    amount, currency = numbers.parse_currency(
+        '-$1,234.50', locale='en_US', allowed_currencies={'USD'},
+    )
+    assert amount == decimal.Decimal('-1234.50')
+    assert currency == 'USD'
+    amount, currency = numbers.parse_currency('-1.234,50 €', locale='de_DE')
+    assert amount == decimal.Decimal('-1234.50')
+    assert currency == 'EUR'
+
+
+def test_parse_currency_accounting_parentheses():
+    amount, currency = numbers.parse_currency(
+        '($1,234.50)', locale='en_US', allowed_currencies={'USD'},
+    )
+    assert amount == decimal.Decimal('-1234.50')
+    assert currency == 'USD'
+    amount, currency = numbers.parse_currency('(1.234,50 €)', locale='de_DE')
+    assert amount == decimal.Decimal('-1234.50')
+    assert currency == 'EUR'
+
+
+def test_parse_currency_without_marker():
+    amount, currency = numbers.parse_currency('1,234.50', locale='en_US')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency is None
+    amount, currency = numbers.parse_currency('1.234,50', locale='de_DE')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency is None
+
+
+def test_parse_currency_ambiguous_symbol():
+    # "$" is used by many currencies and must not be resolved arbitrarily
+    with pytest.raises(numbers.NumberFormatError) as info:
+        numbers.parse_currency('$1,234.50', locale='en_US')
+    assert 'USD' in info.value.suggestions
+    assert 'CAD' in info.value.suggestions
+    # An allowed set that still contains multiple candidates stays ambiguous
+    with pytest.raises(numbers.NumberFormatError) as info:
+        numbers.parse_currency(
+            '$1,234.50', locale='en_US', allowed_currencies={'USD', 'CAD'},
+        )
+    assert info.value.suggestions == ['CAD', 'USD']
+    # An allowed set with a single matching candidate disambiguates
+    amount, currency = numbers.parse_currency(
+        '$1,234.50', locale='en_US', allowed_currencies={'USD', 'EUR'},
+    )
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'USD'
+
+
+def test_parse_currency_disallowed_currency():
+    with pytest.raises(numbers.NumberFormatError):
+        numbers.parse_currency(
+            '1.234,50 €', locale='de_DE', allowed_currencies={'USD'},
+        )
+    with pytest.raises(numbers.UnknownCurrencyError):
+        numbers.parse_currency(
+            '1.234,50 €', locale='de_DE', allowed_currencies={'NOPE'},
+        )
+
+
+def test_parse_currency_strict():
+    # Properly formatted amounts are accepted
+    amount, currency = numbers.parse_currency('1.234,50 €', locale='de_DE', strict=True)
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'EUR'
+    # Misplaced grouping symbols are rejected
+    with pytest.raises(numbers.NumberFormatError):
+        numbers.parse_currency('11.11 €', locale='de_DE', strict=True)
+    # Repeated currency symbols are rejected
+    with pytest.raises(numbers.NumberFormatError):
+        numbers.parse_currency(
+            '$$1,234.50', locale='en_US', allowed_currencies={'USD'}, strict=True,
+        )

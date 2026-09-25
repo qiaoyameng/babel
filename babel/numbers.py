@@ -25,8 +25,9 @@ import datetime
 import decimal
 import re
 import warnings
-from typing import Any, Literal, cast, overload
+from typing import Any, Iterable, Literal, cast, overload
 
+from babel import localedata
 from babel.core import Locale, default_locale, get_global
 from babel.localedata import LocaleDataDict
 
@@ -1263,6 +1264,215 @@ def _remove_trailing_zeros_after_decimal(string: str, decimal_symbol: str) -> st
         return integer_part
 
     return string
+
+
+_currency_symbol_map: dict[str, set[str]] | None = None
+
+
+def _get_currency_symbol_map() -> dict[str, set[str]]:
+    """Return a mapping of currency symbols to the sets of currency codes using them.
+
+    The mapping is built from the currency symbols of all known locales, so
+    ambiguous symbols such as ``$`` map to all of their candidate currencies.
+    Symbols that are identical to their currency code (e.g. ``CHF``) are
+    excluded; those are recognized as currency codes instead.
+    """
+    global _currency_symbol_map
+    if _currency_symbol_map is None:
+        mapping: dict[str, set[str]] = {}
+        for identifier in localedata.locale_identifiers():
+            if identifier == 'root':
+                continue
+            for code, symbol in Locale.parse(identifier).currency_symbols.items():
+                if symbol and symbol != code:
+                    mapping.setdefault(symbol, set()).add(code)
+        _currency_symbol_map = mapping
+    return _currency_symbol_map
+
+
+def _find_currency_markers(text: str) -> list[tuple[int, int, set[str]]]:
+    """Find currency codes and symbols in ``text``.
+
+    Returns a sorted list of ``(start, end, candidates)`` tuples, where
+    ``candidates`` is the set of currency codes the matched marker may denote.
+    Longer symbols are matched first so that e.g. ``US$`` is not also matched
+    as ``$``.
+    """
+    markers: list[tuple[int, int, set[str]]] = []
+    all_currencies = get_global('all_currencies')
+    for match in re.finditer(r'[A-Z]{3}', text):
+        start, end = match.span()
+        if start > 0 and text[start - 1].isalpha():
+            continue
+        if end < len(text) and text[end].isalpha():
+            continue
+        code = match.group(0)
+        if code in all_currencies:
+            markers.append((start, end, {code}))
+    symbol_map = _get_currency_symbol_map()
+    for symbol in sorted(symbol_map, key=len, reverse=True):
+        for match in re.finditer(re.escape(symbol), text):
+            start, end = match.span()
+            if symbol[:1].isalpha() and start > 0 and text[start - 1].isalpha():
+                continue
+            if symbol[-1:].isalpha() and end < len(text) and text[end].isalpha():
+                continue
+            if any(start < taken_end and end > taken_start for taken_start, taken_end, _ in markers):
+                continue
+            markers.append((start, end, set(symbol_map[symbol])))
+    markers.sort()
+    return markers
+
+
+def parse_currency(
+    string: str,
+    locale: Locale | str | None = None,
+    allowed_currencies: Iterable[str] | None = None,
+    strict: bool = False,
+) -> tuple[decimal.Decimal, str | None]:
+    """Parse a localized currency string into an amount and a currency code.
+
+    >>> parse_currency('1.234,50 €', locale='de_DE')
+    (Decimal('1234.50'), 'EUR')
+    >>> parse_currency('$1,234.50', locale='en_US', allowed_currencies={'USD'})
+    (Decimal('1234.50'), 'USD')
+    >>> parse_currency('1\\u202f234,50 €', locale='fr_FR')
+    (Decimal('1234.50'), 'EUR')
+
+    Both currency codes and currency symbols are recognized.  Negative
+    amounts may be denoted by a minus sign or by accounting-style
+    parentheses:
+
+    >>> parse_currency('(€1,234.50)', locale='en_US', allowed_currencies={'EUR'})
+    (Decimal('-1234.50'), 'EUR')
+
+    Ambiguous symbols such as ``$`` are not resolved arbitrarily; pass
+    ``allowed_currencies`` to disambiguate them.  If the symbol is still not
+    unique, an exception listing the candidates is raised:
+
+    >>> parse_currency('$1,234.50', locale='en_US')
+    Traceback (most recent call last):
+        ...
+    NumberFormatError: '$1,234.50' contains an ambiguous currency marker '$' \
+(candidates: ARS, AUD, BBD, BMD, BND, BSD, BZD, CAD, CLP, COP, CUP, FJD, GYD, \
+JMD, KYD, LRD, MXN, NAD, NZD, SBD, SGD, SRD, TTD, TWD, USD, UYU, XCD); \
+pass `allowed_currencies` to disambiguate
+
+    If the string contains no currency marker at all, the currency is
+    returned as `None`:
+
+    >>> parse_currency('1,234.50', locale='en_US')
+    (Decimal('1234.50'), None)
+
+    If `strict` is set to `True`, numbers with misplaced grouping symbols and
+    repeated currency symbols are rejected:
+
+    >>> parse_currency('11.11 €', locale='de', strict=True)
+    Traceback (most recent call last):
+        ...
+    NumberFormatError: '11.11' is not a properly formatted decimal number. \
+Did you mean '1.111'? Or maybe '11,11'?
+
+    .. versionadded:: 2.19
+
+    :param string: the string to parse
+    :param locale: the `Locale` object or locale identifier. Defaults to the system currency locale.
+    :param allowed_currencies: an optional iterable of currency codes the
+                               parsed currency is restricted to.  Used to
+                               disambiguate symbols shared by multiple
+                               currencies, such as ``$``.
+    :param strict: controls whether numbers formatted in a weird way and
+                   repeated currency symbols are accepted or rejected
+    :return: a ``(amount, currency)`` tuple, where ``amount`` is a `Decimal`
+             and ``currency`` is a currency code or `None` if the string
+             contains no currency marker
+    :raise `NumberFormatError`: if the string can not be converted to an
+                                amount, if the currency marker is ambiguous,
+                                or if the currency is not allowed
+    :raise `UnknownCurrencyError`: if ``allowed_currencies`` contains an
+                                   unknown currency code
+    """
+    locale = Locale.parse(locale or LC_MONETARY)
+
+    if allowed_currencies is None:
+        allowed: set[str] | None = None
+    else:
+        allowed = set()
+        for currency in allowed_currencies:
+            currency = currency.upper()
+            validate_currency(currency)
+            allowed.add(currency)
+
+    text = string.strip()
+
+    # Accounting-style parentheses denote a negative amount.
+    negative = False
+    if text.startswith('(') and text.endswith(')'):
+        negative = True
+        text = text[1:-1].strip()
+
+    markers = _find_currency_markers(text)
+
+    if strict:
+        seen_markers: set[str] = set()
+        for start, end, _ in markers:
+            marker = text[start:end]
+            if marker in seen_markers:
+                raise NumberFormatError(
+                    f"{string!r} contains the currency symbol {marker!r} more than once",
+                )
+            seen_markers.add(marker)
+
+    remainder = text
+    for start, end, _ in reversed(markers):
+        remainder = remainder[:start] + ' ' + remainder[end:]
+    remainder = remainder.strip()
+
+    # Normalize localized sign symbols to ASCII and move a trailing sign
+    # (e.g. "1.234,50 -") to the front so the number can be parsed.
+    for sign, replacement in (
+        (get_minus_sign_symbol(locale), '-'),
+        (get_plus_sign_symbol(locale), '+'),
+    ):
+        if sign != replacement:
+            remainder = remainder.replace(sign, replacement)
+    trailing_sign = re.match(r'^(.*?)\s*([-+])$', remainder)
+    if trailing_sign and not remainder.startswith(('-', '+')):
+        remainder = trailing_sign.group(2) + trailing_sign.group(1)
+    remainder = re.sub(r'^([-+])\s+', r'\1', remainder).strip()
+
+    amount = parse_decimal(remainder, locale=locale, strict=strict)
+    if negative:
+        amount = -amount
+
+    currency = None
+    if markers:
+        candidates: set[str] | None = None
+        for _, _, marker_candidates in markers:
+            if allowed is not None:
+                marker_candidates &= allowed
+            candidates = marker_candidates if candidates is None else candidates & marker_candidates
+        assert candidates is not None
+        if not candidates:
+            if allowed is not None:
+                raise NumberFormatError(
+                    f"The currency in {string!r} is not one of the allowed currencies: "
+                    f"{', '.join(sorted(allowed))}",
+                )
+            raise NumberFormatError(
+                f"{string!r} contains conflicting currency markers",
+            )
+        if len(candidates) > 1:
+            marker_text = next(text[start:end] for start, end, _ in markers)
+            raise NumberFormatError(
+                f"{string!r} contains an ambiguous currency marker {marker_text!r} "
+                f"(candidates: {', '.join(sorted(candidates))}); "
+                f"pass `allowed_currencies` to disambiguate",
+                suggestions=sorted(candidates),
+            )
+        currency = candidates.pop()
+
+    return amount, currency
 
 
 _number_pattern_re = re.compile(

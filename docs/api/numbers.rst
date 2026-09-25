@@ -30,6 +30,8 @@ Number Parsing
 
 .. autofunction:: parse_decimal
 
+.. autofunction:: parse_currency
+
 Exceptions
 ----------
 
