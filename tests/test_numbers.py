@@ -329,6 +329,61 @@ def test_format_compact_currency_invalid_format_type():
         numbers.format_compact_currency(1099.98, 'USD', locale='en_US', format_type='unknown')
 
 
+def test_format_currency_range():
+    # Symbol before the amount: the currency marker is only rendered once.
+    assert numbers.format_currency_range(1, 5, 'USD', locale='en_US') == '$1.00\u20135.00'
+    assert numbers.format_currency_range(1099.98, 5000, 'USD', locale='en_US') == '$1,099.98\u20135,000.00'
+
+    # Symbol after the amount, with the locale's no-break space preserved.
+    assert numbers.format_currency_range(1, 5, 'EUR', locale='de_DE') == '1,00\u20135,00\xa0\u20ac'
+    assert numbers.format_currency_range(1099.98, 5000, 'USD', locale='fr_FR') == '1\u202f099,98\u20135\u202f000,00\xa0$US'
+
+    # RTL locale: bidirectional control characters and no-break spaces survive.
+    assert numbers.format_currency_range(1099, 5000, 'USD', locale='ar_EG', numbering_system='default') == '\u200f1\u066c099\u066b00\u20135\u066c000\u066b00\xa0US$'
+
+    # Zero-decimal currencies keep their natural precision.
+    assert numbers.format_currency_range(1099, 5000, 'JPY', locale='en_US') == '\xa51,099\u20135,000'
+
+
+def test_format_currency_range_single_value():
+    assert numbers.format_currency_range(5, 5, 'USD', locale='en_US') == '$5.00'
+    # Endpoints rounding to the same amount collapse into a single value.
+    assert numbers.format_currency_range(5.001, 5.004, 'USD', locale='en_US') == '$5.00'
+    assert numbers.format_currency_range(-5, -5, 'USD', locale='en_US') == '-$5.00'
+
+
+def test_format_currency_range_sign_boundary():
+    # Crossing the sign boundary: both endpoints are rendered in full.
+    assert numbers.format_currency_range(-5, 5, 'USD', locale='en_US') == '-$5.00\u2013$5.00'
+    assert numbers.format_currency_range(-5, -1, 'USD', locale='en_US') == '-$5.00\u2013-$1.00'
+    # Accounting parentheses carry sign information and must be kept.
+    assert numbers.format_currency_range(-5, -1, 'USD', locale='en_US', format_type='accounting') == '($5.00)\u2013($1.00)'
+    assert numbers.format_currency_range(-5, 1, 'USD', locale='en_US', format_type='accounting') == '($5.00)\u2013$1.00'
+
+
+def test_format_currency_range_options():
+    assert numbers.format_currency_range(1, 5, 'USD', locale='en_US', range_separator=' to ') == '$1.00 to 5.00'
+    assert numbers.format_currency_range(1234.5, 5678.5, 'USD', locale='en_US', group_separator=False) == '$1234.50\u20135678.50'
+    assert numbers.format_currency_range(1.234, 5.678, 'USD', locale='en_US', currency_digits=False) == '$1.23\u20135.68'
+    assert numbers.format_currency_range(1.234, 5.678, 'USD', locale='en_US', decimal_quantization=False) == '$1.234\u20135.678'
+    assert numbers.format_currency_range(1, 5, 'EUR', '\xa4\xa4 #,##0.00', locale='en_US') == 'EUR 1.00\u20135.00'
+    # Long currency names have per-endpoint plural forms and are not collapsed.
+    assert numbers.format_currency_range(1, 5, 'USD', locale='en_US', format_type='name') == '1.00 US dollar\u20135.00 US dollars'
+    assert numbers.format_currency_range(2, 2, 'USD', locale='en_US', format_type='name') == '2.00 US dollars'
+
+
+def test_format_currency_range_invalid():
+    for bad_value in (float('nan'), float('inf'), float('-inf')):
+        with pytest.raises(numbers.NumberFormatError, match='finite'):
+            numbers.format_currency_range(bad_value, 5, 'USD', locale='en_US')
+        with pytest.raises(numbers.NumberFormatError, match='finite'):
+            numbers.format_currency_range(1, bad_value, 'USD', locale='en_US')
+    with pytest.raises(numbers.NumberFormatError, match='greater'):
+        numbers.format_currency_range(5, 1, 'USD', locale='en_US')
+    with pytest.raises(numbers.UnknownCurrencyFormatError):
+        numbers.format_currency_range(1, 5, 'USD', locale='en_US', format_type='unknown')
+
+
 @pytest.mark.parametrize(('input_value', 'expected_value'), [
     ('10000', '$10,000.00'),
     ('1', '$1.00'),
