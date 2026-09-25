@@ -30,10 +30,15 @@ Number Parsing
 
 .. autofunction:: parse_decimal
 
+.. autofunction:: parse_currency
+
 Exceptions
 ----------
 
 .. autoexception:: NumberFormatError
+    :members:
+
+.. autoexception:: AmbiguousCurrencyError
     :members:
 
 .. autoexception:: UnknownCurrencyError

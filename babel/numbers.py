@@ -25,8 +25,10 @@ import datetime
 import decimal
 import re
 import warnings
+from collections.abc import Iterable
 from typing import Any, Literal, cast, overload
 
+from babel import localedata
 from babel.core import Locale, default_locale, get_global
 from babel.localedata import LocaleDataDict
 
@@ -1072,6 +1074,25 @@ class NumberFormatError(ValueError):
         self.suggestions = suggestions
 
 
+class AmbiguousCurrencyError(NumberFormatError):
+    """Exception raised when a currency symbol matches multiple currencies
+    and cannot be disambiguated.
+
+    .. versionadded:: 2.19
+    """
+
+    def __init__(self, symbol: str, candidates: list[str]) -> None:
+        super().__init__(
+            f"Currency symbol {symbol!r} is ambiguous; "
+            f"it may refer to any of: {', '.join(candidates)}. "
+            f"Pass an explicit set of allowed currencies to disambiguate.",
+        )
+        #: the ambiguous currency symbol or code found in the input
+        self.symbol = symbol
+        #: the currency codes the symbol may refer to, sorted alphabetically
+        self.candidates = candidates
+
+
 SPACE_CHARS = {
     ' ',  # space
     '\xa0',  # no-break space
@@ -1231,6 +1252,219 @@ def parse_decimal(
                         suggestions=[proper, proper_alt],
                     )
     return parsed
+
+
+_currency_code_re = re.compile(r'(?<![A-Za-z])[A-Za-z]{3}(?![A-Za-z])')
+
+_currency_symbol_map: dict[str, set[str]] | None = None
+
+
+def _get_currency_symbol_map() -> dict[str, set[str]]:
+    """Return a map of currency symbols to the currency codes using them.
+
+    The map is collected from the currency symbols of all locales, so that
+    ambiguous symbols (such as ``$``) can be resolved against every currency
+    that uses them.  Building it requires loading all locale data, so it is
+    cached after the first call.
+    """
+    global _currency_symbol_map
+    if _currency_symbol_map is None:
+        mapping: dict[str, set[str]] = {}
+        for locale_id in localedata.locale_identifiers():
+            data = localedata.load(locale_id)
+            for code, symbol in data.get('currency_symbols', {}).items():
+                if symbol and symbol != code:
+                    mapping.setdefault(symbol, set()).add(code)
+        _currency_symbol_map = mapping
+    return _currency_symbol_map
+
+
+def _find_currency_markers(string: str) -> list[tuple[int, int, set[str]]]:
+    """Find currency codes and symbols in a string.
+
+    Returns a list of ``(start, end, candidates)`` tuples, where
+    ``candidates`` is the set of currency codes the matched text may refer
+    to.  Overlapping matches are resolved by preferring longer matches.
+    """
+    matches: list[tuple[int, int, set[str]]] = []
+    known_currencies = list_currencies()
+    for match in _currency_code_re.finditer(string):
+        code = match.group().upper()
+        if code in known_currencies:
+            matches.append((match.start(), match.end(), {code}))
+    for symbol, codes in _get_currency_symbol_map().items():
+        start = string.find(symbol)
+        while start != -1:
+            matches.append((start, start + len(symbol), codes))
+            start = string.find(symbol, start + 1)
+    # Resolve overlaps: earlier matches first, longer matches win.
+    matches.sort(key=lambda match: (match[0], -(match[1] - match[0])))
+    result = []
+    end_so_far = -1
+    for match in matches:
+        if match[0] >= end_so_far:
+            result.append(match)
+            end_so_far = match[1]
+    return result
+
+
+def parse_currency(
+    string: str,
+    locale: Locale | str | None = None,
+    currencies: Iterable[str] | None = None,
+    strict: bool = False,
+    *,
+    numbering_system: Literal["default"] | str = "latn",
+) -> tuple[decimal.Decimal, str | None]:
+    """Parse a localized currency amount into a decimal and a currency code.
+
+    The numeric part is parsed according to the given locale, honoring its
+    decimal and grouping symbols, spaces, minus signs and accounting-style
+    parentheses.  The currency may be denoted by its ISO code or by a
+    symbol, in front of or behind the amount:
+
+    >>> parse_currency('1.234,50 €', locale='de_DE')
+    (Decimal('1234.50'), 'EUR')
+    >>> parse_currency('EUR 1.234,50', locale='de_DE')
+    (Decimal('1234.50'), 'EUR')
+    >>> parse_currency('(1.234,50 €)', locale='de_DE')
+    (Decimal('-1234.50'), 'EUR')
+
+    If the input contains no currency code or symbol at all, the currency
+    of the result is `None`:
+
+    >>> parse_currency('1,234.50', locale='en_US')
+    (Decimal('1234.50'), None)
+
+    Some symbols are used by more than one currency.  Such symbols are not
+    resolved by guessing; instead, the optional `currencies` set can be
+    used to restrict the allowed currencies:
+
+    >>> parse_currency('$1,234.50', locale='en_US', currencies={'USD'})
+    (Decimal('1234.50'), 'USD')
+
+    If a symbol is still ambiguous, an `AmbiguousCurrencyError` is raised
+    listing the remaining candidates:
+
+    >>> parse_currency('$1,234.50', locale='en_US', currencies={'USD', 'CAD'})
+    Traceback (most recent call last):
+        ...
+    AmbiguousCurrencyError: Currency symbol '$' is ambiguous; it may refer to any of: CAD, USD. ...
+
+    If `strict` is set to `True`, numbers with misplaced grouping and
+    inputs with repeated currency symbols or codes are rejected:
+
+    >>> parse_currency('12.34,50 €', locale='de_DE', strict=True)
+    Traceback (most recent call last):
+        ...
+    NumberFormatError: '12.34,50 €' is not a valid currency amount ...
+    >>> parse_currency('€1.234,50 EUR', locale='de_DE', strict=True)
+    Traceback (most recent call last):
+        ...
+    NumberFormatError: '€1.234,50 EUR' contains more than one currency symbol or code
+
+    .. versionadded:: 2.19
+
+    :param string: the string to parse
+    :param locale: the `Locale` object or locale identifier. Defaults to the system numeric locale.
+    :param currencies: an optional iterable of currency codes the parsed
+                       currency is restricted to; used to disambiguate
+                       symbols shared by multiple currencies
+    :param strict: controls whether numbers formatted in a weird way and
+                   repeated currency symbols or codes are accepted or rejected
+    :param numbering_system: The numbering system used for formatting number symbols. Defaults to "latn".
+                             The special value "default" will use the default numbering system of the locale.
+    :return: a tuple of the parsed amount and the currency code, or `None`
+             if the input contains no currency code or symbol
+    :raise `NumberFormatError`: if the amount can not be converted to a
+                                decimal number, or if the input contains
+                                conflicting or disallowed currencies
+    :raise `AmbiguousCurrencyError`: if a currency symbol matches multiple
+                                    currencies and cannot be disambiguated
+    :raise `UnknownCurrencyError`: if `currencies` contains an unknown
+                                  currency code
+    :raise `UnsupportedNumberingSystemError`: if the numbering system is not supported by the locale.
+    """
+    locale = Locale.parse(locale or LC_NUMERIC)
+
+    if currencies is None:
+        allowed_currencies = None
+    else:
+        allowed_currencies = set()
+        for currency in currencies:
+            normalized = normalize_currency(currency)
+            if normalized is None:
+                raise UnknownCurrencyError(currency)
+            allowed_currencies.add(normalized)
+
+    original = string
+    string = string.strip()
+
+    # Accounting-style parentheses denote a negative amount.
+    negative = False
+    if string.startswith('(') and string.endswith(')'):
+        negative = True
+        string = string[1:-1].strip()
+
+    matches = _find_currency_markers(string)
+
+    if strict and len(matches) > 1:
+        raise NumberFormatError(
+            f"{original!r} contains more than one currency symbol or code",
+        )
+
+    currency = None
+    if matches:
+        # Intersect the candidates of all markers, so that e.g. "$1,234.50 USD"
+        # resolves to USD even though "$" alone would be ambiguous.
+        candidates = set(matches[0][2])
+        for _, _, codes in matches[1:]:
+            candidates &= codes
+        if not candidates:
+            raise NumberFormatError(
+                f"{original!r} contains conflicting currency symbols or codes",
+            )
+        if allowed_currencies is not None:
+            candidates = candidates & allowed_currencies
+            if not candidates:
+                raise NumberFormatError(
+                    f"{original!r} contains a currency that is not among the "
+                    f"allowed currencies: {', '.join(sorted(allowed_currencies))}",
+                )
+        if len(candidates) > 1:
+            start, end, _ = matches[0]
+            raise AmbiguousCurrencyError(string[start:end], sorted(candidates))
+        currency = next(iter(candidates))
+
+        # Remove the currency markers, leaving only the numeric part.
+        parts = []
+        pos = 0
+        for start, end, _ in matches:
+            parts.append(string[pos:start])
+            pos = end
+        parts.append(string[pos:])
+        string = ''.join(parts).strip()
+
+    # The currency marker may have sat outside accounting parentheses.
+    if string.startswith('(') and string.endswith(')'):
+        negative = True
+        string = string[1:-1].strip()
+
+    try:
+        amount = parse_decimal(
+            string,
+            locale=locale,
+            strict=strict,
+            numbering_system=numbering_system,
+        )
+    except NumberFormatError as exc:
+        raise NumberFormatError(
+            f"{original!r} is not a valid currency amount ({exc})",
+            suggestions=exc.suggestions,
+        ) from exc
+    if negative:
+        amount = -amount
+    return amount, currency
 
 
 def _remove_trailing_zeros_after_decimal(string: str, decimal_symbol: str) -> str:

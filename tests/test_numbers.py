@@ -579,6 +579,110 @@ def test_parse_decimal_group_separator_can_be_any_space(string):
     assert decimal.Decimal('1099.98') == numbers.parse_decimal(string, locale='fr')
 
 
+def test_parse_currency_en_us():
+    amount, currency = numbers.parse_currency('$1,234.50', locale='en_US', currencies={'USD'})
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'USD'
+
+
+def test_parse_currency_de():
+    amount, currency = numbers.parse_currency('1.234,50 €', locale='de_DE')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'EUR'
+
+
+def test_parse_currency_fr():
+    amount, currency = numbers.parse_currency('1\u202f234,50\u00a0€', locale='fr_FR')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'EUR'
+
+
+def test_parse_currency_code():
+    amount, currency = numbers.parse_currency('EUR 1.234,50', locale='de_DE')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'EUR'
+
+
+def test_parse_currency_negative():
+    amount, currency = numbers.parse_currency('-1.234,50 €', locale='de_DE')
+    assert amount == decimal.Decimal('-1234.50')
+    assert currency == 'EUR'
+
+
+def test_parse_currency_accounting_parentheses():
+    amount, currency = numbers.parse_currency('($1,234.50)', locale='en_US', currencies={'USD'})
+    assert amount == decimal.Decimal('-1234.50')
+    assert currency == 'USD'
+
+    amount, currency = numbers.parse_currency('$(1,234.50)', locale='en_US', currencies={'USD'})
+    assert amount == decimal.Decimal('-1234.50')
+    assert currency == 'USD'
+
+
+def test_parse_currency_no_currency_marker():
+    amount, currency = numbers.parse_currency('1,234.50', locale='en_US')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency is None
+
+
+def test_parse_currency_ambiguous_symbol():
+    with pytest.raises(numbers.AmbiguousCurrencyError) as excinfo:
+        numbers.parse_currency('$1,234.50', locale='en_US')
+    assert excinfo.value.symbol == '$'
+    assert 'USD' in excinfo.value.candidates
+    assert 'CAD' in excinfo.value.candidates
+
+
+def test_parse_currency_ambiguous_symbol_disambiguated_by_allowed_currencies():
+    amount, currency = numbers.parse_currency('$1,234.50', locale='en_US', currencies={'CAD'})
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'CAD'
+
+    with pytest.raises(numbers.AmbiguousCurrencyError) as excinfo:
+        numbers.parse_currency('$1,234.50', locale='en_US', currencies={'USD', 'CAD'})
+    assert excinfo.value.candidates == ['CAD', 'USD']
+
+
+def test_parse_currency_repeated_markers_disambiguate():
+    amount, currency = numbers.parse_currency('$1,234.50 USD', locale='en_US')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'USD'
+
+
+def test_parse_currency_conflicting_markers():
+    with pytest.raises(numbers.NumberFormatError, match='conflicting currency'):
+        numbers.parse_currency('EUR 1.234,50 USD', locale='de_DE')
+
+
+def test_parse_currency_currency_not_allowed():
+    with pytest.raises(numbers.NumberFormatError, match='not among the allowed currencies'):
+        numbers.parse_currency('1.234,50 €', locale='de_DE', currencies={'USD'})
+
+
+def test_parse_currency_unknown_allowed_currency():
+    with pytest.raises(UnknownCurrencyError):
+        numbers.parse_currency('$1,234.50', locale='en_US', currencies={'XYZ'})
+
+
+def test_parse_currency_strict_misplaced_grouping():
+    with pytest.raises(numbers.NumberFormatError, match='not a valid currency amount'):
+        numbers.parse_currency('12.34,50 €', locale='de_DE', strict=True)
+
+
+def test_parse_currency_strict_repeated_symbols():
+    with pytest.raises(numbers.NumberFormatError, match='more than one currency'):
+        numbers.parse_currency('€1.234,50 EUR', locale='de_DE', strict=True)
+
+    amount, currency = numbers.parse_currency('€1.234,50 EUR', locale='de_DE')
+    assert amount == decimal.Decimal('1234.50')
+    assert currency == 'EUR'
+
+
+def test_parse_currency_invalid_amount():
+    with pytest.raises(numbers.NumberFormatError, match='not a valid currency amount'):
+        numbers.parse_currency('abc €', locale='de_DE')
+
+
 def test_parse_grouping():
     assert numbers.parse_grouping('##') == (1000, 1000)
     assert numbers.parse_grouping('#,###') == (3, 3)
