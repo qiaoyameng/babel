@@ -1390,6 +1390,332 @@ def parse_time(
     return datetime.time(hour, minute, second)
 
 
+def _get_month_name_lookup(
+    locale: Locale,
+) -> tuple[dict[str, set[int]], str]:
+    """Build a case-insensitive month name lookup for `parse_datetime`.
+
+    Returns a dict mapping case-folded month names to the set of month
+    numbers they may refer to (narrow names such as "J" can be ambiguous),
+    and a regex alternation matching any of the names.
+    """
+    names: dict[str, set[int]] = {}
+    for context in ('format', 'stand-alone'):
+        for width in ('wide', 'abbreviated', 'narrow'):
+            for month, name in get_month_names(width, context, locale).items():
+                if name:
+                    names.setdefault(name.casefold(), set()).add(month)
+    alternation = '|'.join(
+        re.escape(name) for name in sorted(names, key=len, reverse=True)
+    )
+    return names, alternation or '(?!)'
+
+
+def _get_period_name_lookup(
+    locale: Locale,
+) -> tuple[dict[str, set[str]], str]:
+    """Build a case-insensitive AM/PM name lookup for `parse_datetime`.
+
+    Returns a dict mapping case-folded period names to the set of period
+    keys ("am"/"pm") they may refer to, and a regex alternation matching
+    any of the names.
+    """
+    names: dict[str, set[str]] = {}
+    for context in ('format', 'stand-alone'):
+        for width in ('wide', 'abbreviated', 'narrow'):
+            periods = locale.day_periods[context][width]
+            for key in ('am', 'pm'):
+                name = periods.get(key)
+                if name:
+                    names.setdefault(name.casefold(), set()).add(key)
+    alternation = '|'.join(
+        re.escape(name) for name in sorted(names, key=len, reverse=True)
+    )
+    return names, alternation or '(?!)'
+
+
+def _get_timezone_offset_regex(locale: Locale) -> str:
+    """Build a regex matching numeric GMT/UTC timezone offsets for `parse_datetime`.
+
+    Matches "Z" as well as offsets such as "+02", "+0200" and "+02:00",
+    optionally prefixed with the locale's GMT format (e.g. "GMT" or "UTC").
+    """
+    offset = r'[+-]\d{2}(?::?\d{2})?'
+    gmt_format = locale.zone_formats['gmt']
+    if '%s' in gmt_format:
+        prefix, _, suffix = gmt_format.partition('%s')
+        gmt_offset = re.escape(prefix) + offset + re.escape(suffix)
+        return f'(?:Z|{gmt_offset}|{offset})'
+    return f'(?:Z|{offset})'
+
+
+def _parse_timezone_offset(value: str) -> datetime.timezone:
+    """Parse a numeric timezone offset string into a `datetime.timezone`."""
+    if value.upper() == 'Z':
+        return UTC
+    sign_match = re.search(r'[+-]', value)
+    sign = -1 if sign_match.group() == '-' else 1
+    digits = value[sign_match.end():].replace(':', '')
+    hours = int(digits[:2])
+    minutes = int(digits[2:4]) if len(digits) > 2 else 0
+    if hours > 23 or minutes > 59:
+        raise ParseError(f"Invalid timezone offset {value!r}")
+    return datetime.timezone(sign * datetime.timedelta(hours=hours, minutes=minutes))
+
+
+def _resolve_local_time(
+    dt: datetime.datetime,
+    tzinfo: datetime.tzinfo,
+    ambiguous: str,
+    nonexistent: str,
+) -> datetime.datetime:
+    """Attach `tzinfo` to the naive datetime `dt`, handling DST edge cases.
+
+    Ambiguous (repeated) and nonexistent (skipped) local times are dealt
+    with according to the `ambiguous` and `nonexistent` arguments; see
+    `parse_datetime` for the accepted values.
+    """
+    if pytz is not None and hasattr(tzinfo, 'localize'):  # pytz-style tzinfo
+        try:
+            return tzinfo.localize(dt, is_dst=None)
+        except pytz.exceptions.AmbiguousTimeError:
+            if ambiguous == 'raise':
+                raise ParseError(
+                    f"{dt!r} is ambiguous in timezone {tzinfo}; pass "
+                    f"ambiguous='earlier' or ambiguous='later' to choose",
+                ) from None
+            # the DST (daylight) interpretation occurs earlier in UTC
+            return tzinfo.localize(dt, is_dst=ambiguous == 'earlier')
+        except pytz.exceptions.NonExistentTimeError:
+            if nonexistent == 'raise':
+                raise ParseError(
+                    f"{dt!r} does not exist in timezone {tzinfo}; pass "
+                    f"nonexistent='shift_forward' or "
+                    f"nonexistent='shift_backward' to choose",
+                ) from None
+            gap = abs(
+                tzinfo.localize(dt, is_dst=True).utcoffset()
+                - tzinfo.localize(dt, is_dst=False).utcoffset()
+            )
+            shifted = dt + gap if nonexistent == 'shift_forward' else dt - gap
+            return tzinfo.localize(shifted, is_dst=None)
+
+    # PEP 495 fold-aware tzinfo (zoneinfo, datetime.timezone, ...)
+    aware = [dt.replace(tzinfo=tzinfo, fold=fold) for fold in (0, 1)]
+    offsets = [candidate.utcoffset() for candidate in aware]
+    exists = [
+        candidate.astimezone(UTC).astimezone(tzinfo).replace(tzinfo=None) == dt
+        for candidate in aware
+    ]
+
+    if any(exists):
+        if offsets[0] != offsets[1] and all(exists):
+            if ambiguous == 'raise':
+                raise ParseError(
+                    f"{dt!r} is ambiguous in timezone {tzinfo}; pass "
+                    f"ambiguous='earlier' or ambiguous='later' to choose",
+                )
+            # the larger offset yields the earlier instant in UTC
+            chosen = max(offsets) if ambiguous == 'earlier' else min(offsets)
+            return aware[offsets.index(chosen)]
+        return aware[0] if exists[0] else aware[1]
+
+    if nonexistent == 'raise':
+        raise ParseError(
+            f"{dt!r} does not exist in timezone {tzinfo}; pass "
+            f"nonexistent='shift_forward' or nonexistent='shift_backward' "
+            f"to choose",
+        )
+    gap = abs(offsets[0] - offsets[1])
+    shifted = dt + gap if nonexistent == 'shift_forward' else dt - gap
+    return shifted.replace(tzinfo=tzinfo)
+
+
+def parse_datetime(
+    string: str,
+    format: str | DateTimePattern,
+    locale: Locale | str | None = None,
+    tzinfo: datetime.tzinfo | None = None,
+    *,
+    ambiguous: Literal['raise', 'earlier', 'later'] = 'raise',
+    nonexistent: Literal['raise', 'shift_forward', 'shift_backward'] = 'raise',
+) -> datetime.datetime:
+    """Parse a datetime from a string according to an explicit format pattern.
+
+    This is the counterpart of `format_datetime`: it is meant for reading
+    back timestamps an application has formatted itself, e.g. in log files.
+
+    >>> parse_datetime('2024-02-29 23:59:58', 'yyyy-MM-dd HH:mm:ss', locale='en_US')
+    datetime.datetime(2024, 2, 29, 23, 59, 58)
+    >>> parse_datetime('1 Apr 2024, 3:30 PM', 'd MMM y, h:mm a', locale='en_US')
+    datetime.datetime(2024, 4, 1, 15, 30)
+
+    The whole input must match the format; trailing or leading garbage
+    raises a `ParseError`, and the parsed values are validated against the
+    real calendar (so e.g. February 30th is rejected).  Field values are
+    taken from the positions the format dictates; the month and day are
+    never swapped around to make an invalid date fit.
+
+    The supported pattern tokens are:
+
+    - ``y``, ``Y``, ``u``: year (two-digit years are read as 20xx)
+    - ``M``, ``L``: month, numeric or as a locale month name
+    - ``d``: day of month
+    - ``H`` (0-23), ``h`` (1-12), ``K`` (0-11), ``k`` (1-24): hour
+    - ``m``: minute, ``s``: second
+    - ``a``: AM/PM day period in the locale's names
+    - ``x``, ``X``, ``Z``, ``O``: numeric timezone offset
+
+    Any other pattern token raises a `ParseError`.
+
+    If the input contains a numeric timezone offset, the result keeps that
+    offset and the `tzinfo` argument is ignored.  Otherwise, if `tzinfo` is
+    given, the parsed wall-clock time is interpreted in that timezone.
+    Local times that are ambiguous or do not exist because of a DST
+    transition raise a `ParseError` by default instead of being silently
+    shifted; pass ``ambiguous='earlier'``/``'later'`` or
+    ``nonexistent='shift_forward'``/``'shift_backward'`` to pick a side
+    explicitly.  (DST edge case detection requires a fold-aware tzinfo,
+    such as ``zoneinfo.ZoneInfo`` or a ``pytz`` timezone.)
+
+    >>> parse_datetime('2024-04-01 15:30 +02:00', 'yyyy-MM-dd HH:mm xxx')
+    datetime.datetime(2024, 4, 1, 15, 30, tzinfo=datetime.timezone(datetime.timedelta(seconds=7200)))
+
+    :param string: the string containing the datetime
+    :param format: the explicit datetime format pattern to parse with
+                   (see ``get_datetime_format`` for the pattern syntax)
+    :param locale: a `Locale` object or a locale identifier. Defaults to the system time locale.
+    :param tzinfo: the timezone to interpret the parsed time in when the
+                   input does not carry a numeric offset itself
+    :param ambiguous: how to handle local times that occur twice due to a
+                      DST transition: "raise" (the default), "earlier", or
+                      "later" (in UTC terms)
+    :param nonexistent: how to handle local times that are skipped by a
+                        DST transition: "raise" (the default),
+                        "shift_forward", or "shift_backward" by the gap
+    :return: the parsed datetime
+    :rtype: `datetime`
+    """
+    if ambiguous not in ('raise', 'earlier', 'later'):
+        raise ValueError(f"Invalid value for ambiguous: {ambiguous!r}")
+    if nonexistent not in ('raise', 'shift_forward', 'shift_backward'):
+        raise ValueError(f"Invalid value for nonexistent: {nonexistent!r}")
+
+    locale = Locale.parse(locale or LC_TIME)
+    pattern = format.pattern if isinstance(format, DateTimePattern) else format
+
+    month_names, month_name_re = _get_month_name_lookup(locale)
+    period_names, period_name_re = _get_period_name_lookup(locale)
+    offset_re = _get_timezone_offset_regex(locale)
+
+    fields: list[tuple[str, str, int]] = []
+    regex_parts = []
+    for tok_type, tok_value in tokenize_pattern(pattern):
+        if tok_type == 'chars':
+            regex_parts.append(re.escape(tok_value))
+            continue
+        char, num = tok_value
+        if char in 'yuY':
+            field_re = r'\d{2}' if num == 2 else r'\d{1,4}'
+        elif char in 'ML':
+            field_re = r'\d{1,2}' if num <= 2 else month_name_re
+        elif char == 'd':
+            field_re = r'\d{1,2}'
+        elif char in 'HhKkms':
+            field_re = r'\d{1,2}'
+        elif char == 'a':
+            field_re = period_name_re
+        elif char in 'xXZO':
+            field_re = offset_re
+        else:
+            raise ParseError(
+                f"parse_datetime() does not support the {char!r} pattern "
+                f"token in format {pattern!r}",
+            )
+        group_name = f'f{len(fields)}'
+        fields.append((group_name, char, num))
+        regex_parts.append(f'(?P<{group_name}>{field_re})')
+
+    match = re.fullmatch(''.join(regex_parts), string, flags=re.IGNORECASE)
+    if match is None:
+        raise ParseError(f"Input {string!r} does not match format {pattern!r}")
+
+    year = month = day = hour = minute = second = None
+    hour_char = period = None
+    offset_tzinfo = None
+    for group_name, char, num in fields:
+        value = match.group(group_name)
+        if char in 'yuY':
+            year = int(value)
+            if num == 2:
+                year += 2000
+        elif char in 'ML':
+            if value.isdigit():
+                month = int(value)
+            else:
+                months = month_names[value.casefold()]
+                if len(months) > 1:
+                    raise ParseError(f"Ambiguous month name {value!r} in input {string!r}")
+                month = next(iter(months))
+        elif char == 'd':
+            day = int(value)
+        elif char in 'HhKk':
+            hour = int(value)
+            hour_char = char
+        elif char == 'm':
+            minute = int(value)
+        elif char == 's':
+            second = int(value)
+        elif char == 'a':
+            periods = period_names[value.casefold()]
+            if len(periods) > 1:
+                raise ParseError(f"Ambiguous day period {value!r} in input {string!r}")
+            period = next(iter(periods))
+        elif char in 'xXZO':
+            offset_tzinfo = _parse_timezone_offset(value)
+
+    missing = [
+        name
+        for name, val in (('year', year), ('month', month), ('day', day))
+        if val is None
+    ]
+    if missing:
+        raise ParseError(
+            f"Format {pattern!r} is missing a {'/'.join(missing)} field",
+        )
+
+    if hour is not None:
+        if hour_char == 'h' and not 1 <= hour <= 12:
+            raise ParseError(f"Invalid hour {hour} for 12-hour clock token 'h'")
+        if hour_char == 'K' and not 0 <= hour <= 11:
+            raise ParseError(f"Invalid hour {hour} for 12-hour clock token 'K'")
+        if hour_char == 'k' and not 1 <= hour <= 24:
+            raise ParseError(f"Invalid hour {hour} for 24-hour clock token 'k'")
+        if hour_char == 'H' and not 0 <= hour <= 23:
+            raise ParseError(f"Invalid hour {hour} for 24-hour clock token 'H'")
+        if period is not None:
+            if hour_char == 'h':
+                hour = hour % 12 + (12 if period == 'pm' else 0)
+            elif hour_char == 'K':
+                hour = hour + (12 if period == 'pm' else 0)
+        if hour_char == 'k' and hour == 24:
+            hour = 0
+
+    try:
+        result = datetime.datetime(
+            year, month, day,
+            hour or 0, minute or 0, second or 0,
+        )
+    except ValueError as e:
+        raise ParseError(f"Invalid datetime in input {string!r}: {e}") from e
+
+    if offset_tzinfo is not None:
+        return result.replace(tzinfo=offset_tzinfo)
+    if tzinfo is None:
+        return result
+    return _resolve_local_time(result, tzinfo, ambiguous, nonexistent)
+
+
 class DateTimePattern:
     def __init__(self, pattern: str, format: DateTimeFormat):
         self.pattern = pattern

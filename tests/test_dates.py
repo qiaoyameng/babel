@@ -11,7 +11,7 @@
 # history and logs, available at https://github.com/python-babel/babel/commits/master/.
 
 import calendar
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 import freezegun
 import pytest
@@ -527,6 +527,207 @@ def test_parse_date_alternate_characters(monkeypatch):
 def test_parse_time_custom_format():
     assert dates.parse_time('15:30:00', format='HH:mm:ss') == time(15, 30)
     assert dates.parse_time('00:30:15', format='ss:mm:HH') == time(15, 30)
+
+
+def test_parse_datetime():
+    assert (dates.parse_datetime('2024-04-01 15:30:45', 'yyyy-MM-dd HH:mm:ss', locale='en_US')
+            == datetime(2024, 4, 1, 15, 30, 45))
+    # fields may appear in any order dictated by the format
+    assert (dates.parse_datetime('45:30 15 01.04.2024', 'ss:mm HH dd.MM.yyyy', locale='en_US')
+            == datetime(2024, 4, 1, 15, 30, 45))
+    # missing time fields default to zero
+    assert (dates.parse_datetime('2024-04-01', 'yyyy-MM-dd', locale='en_US')
+            == datetime(2024, 4, 1))
+
+
+def test_parse_datetime_month_names():
+    assert (dates.parse_datetime('1 Apr 2024, 3:30 PM', 'd MMM y, h:mm a', locale='en_US')
+            == datetime(2024, 4, 1, 15, 30))
+    assert (dates.parse_datetime('1 April 2024', 'd MMMM y', locale='en_US')
+            == datetime(2024, 4, 1))
+    assert (dates.parse_datetime('10. März 2024, 07:05', 'd. MMMM yyyy, HH:mm', locale='de')
+            == datetime(2024, 3, 10, 7, 5))
+    assert (dates.parse_datetime('10. März 2024', 'd. MMM yyyy', locale='de')
+            == datetime(2024, 3, 10))
+
+
+def test_parse_datetime_am_pm():
+    fmt = 'yyyy-MM-dd h:mm a'
+    # noon and midnight are the tricky edges of the 12-hour clock
+    assert (dates.parse_datetime('2024-04-01 12:05 AM', fmt, locale='en_US')
+            == datetime(2024, 4, 1, 0, 5))
+    assert (dates.parse_datetime('2024-04-01 12:05 PM', fmt, locale='en_US')
+            == datetime(2024, 4, 1, 12, 5))
+    assert (dates.parse_datetime('2024-04-01 3:30 pm', fmt, locale='en_US')
+            == datetime(2024, 4, 1, 15, 30))
+    assert (dates.parse_datetime('2024-04-01 3:30 am', fmt, locale='en_US')
+            == datetime(2024, 4, 1, 3, 30))
+    # 'K' counts 0-11, 'k' counts 1-24
+    assert (dates.parse_datetime('2024-04-01 11:05 PM', 'yyyy-MM-dd K:mm a', locale='en_US')
+            == datetime(2024, 4, 1, 23, 5))
+    assert (dates.parse_datetime('2024-04-01 24:05', 'yyyy-MM-dd k:mm', locale='en_US')
+            == datetime(2024, 4, 1, 0, 5))
+    # hour 13 is not valid for a 12-hour clock token
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('2024-04-01 13:05 PM', fmt, locale='en_US')
+
+
+def test_parse_datetime_leap_day_and_calendar_validation():
+    fmt = 'yyyy-MM-dd HH:mm:ss'
+    assert (dates.parse_datetime('2024-02-29 23:59:58', fmt, locale='en_US')
+            == datetime(2024, 2, 29, 23, 59, 58))
+    # 2023 is not a leap year
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('2023-02-29 23:59:58', fmt, locale='en_US')
+    # February 30th never exists
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('2024-02-30 23:59:58', fmt, locale='en_US')
+    # month 13 must not be "fixed" by swapping month and day
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('2024-13-01 00:00:00', fmt, locale='en_US')
+    # neither are hours/minutes/seconds out of range
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('2024-04-01 24:00:00', fmt, locale='en_US')
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('2024-04-01 00:61:00', fmt, locale='en_US')
+
+
+def test_parse_datetime_consumes_entire_input():
+    fmt = 'yyyy-MM-dd HH:mm:ss'
+    # trailing garbage
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('2024-04-01 15:30:45xyz', fmt, locale='en_US')
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('2024-04-01 15:30:45 extra', fmt, locale='en_US')
+    # leading garbage
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('ts=2024-04-01 15:30:45', fmt, locale='en_US')
+    # missing fields
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('2024-04-01 15:30', fmt, locale='en_US')
+    # the format must contain year, month and day fields
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('04-01 15:30:45', 'MM-dd HH:mm:ss', locale='en_US')
+
+
+def test_parse_datetime_unsupported_token():
+    for fmt in ['E, yyyy-MM-dd', 'yyyy-MM-dd HH:mm:ss.S', 'yyyy-MM-dd z',
+                'yyyy-QQQ-dd', 'yyyy-MM-dd HH:mm:ss b']:
+        with pytest.raises(dates.ParseError, match='does not support'):
+            dates.parse_datetime('whatever', fmt, locale='en_US')
+
+
+def test_parse_datetime_numeric_timezone_offset():
+    tz_plus2 = timezone(timedelta(hours=2))
+    assert (dates.parse_datetime('2024-04-01 15:30 +02:00', 'yyyy-MM-dd HH:mm xxx', locale='en_US')
+            == datetime(2024, 4, 1, 15, 30, tzinfo=tz_plus2))
+    assert (dates.parse_datetime('2024-04-01 15:30 +0200', 'yyyy-MM-dd HH:mm xx', locale='en_US')
+            == datetime(2024, 4, 1, 15, 30, tzinfo=tz_plus2))
+    assert (dates.parse_datetime('2024-04-01 15:30 +02', 'yyyy-MM-dd HH:mm x', locale='en_US')
+            == datetime(2024, 4, 1, 15, 30, tzinfo=tz_plus2))
+    assert (dates.parse_datetime('2024-04-01 15:30 GMT+02:00', 'yyyy-MM-dd HH:mm O', locale='en_US')
+            == datetime(2024, 4, 1, 15, 30, tzinfo=tz_plus2))
+    assert (dates.parse_datetime('2024-04-01 15:30 Z', 'yyyy-MM-dd HH:mm X', locale='en_US')
+            == datetime(2024, 4, 1, 15, 30, tzinfo=UTC))
+    # negative offsets work too
+    assert (dates.parse_datetime('2024-04-01 15:30 -04:00', 'yyyy-MM-dd HH:mm xxx', locale='en_US')
+            == datetime(2024, 4, 1, 15, 30, tzinfo=timezone(timedelta(hours=-4))))
+    # an offset in the input wins over the tzinfo argument
+    eastern = dates.get_timezone('America/New_York')
+    parsed = dates.parse_datetime('2024-04-01 15:30 +02:00', 'yyyy-MM-dd HH:mm xxx',
+                                  locale='en_US', tzinfo=eastern)
+    assert parsed.utcoffset() == timedelta(hours=2)
+    # invalid offsets are rejected
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('2024-04-01 15:30 +24:00', 'yyyy-MM-dd HH:mm xxx', locale='en_US')
+    with pytest.raises(dates.ParseError):
+        dates.parse_datetime('2024-04-01 15:30 +02:60', 'yyyy-MM-dd HH:mm xxx', locale='en_US')
+
+
+@pytest.mark.parametrize('fmt', [
+    'yyyy-MM-dd HH:mm:ss',
+    'd MMM y h:mm a',
+    "yyyy-MM-dd'T'HH:mm:ssXXX",
+    'MMM d, yyyy, h:mm:ss a ZZZZ',
+    'yyyy-MM-dd HH:mm:ss x',
+    'yyyy-MM-dd HH:mm:ss Z',
+    'yyyy-MM-dd HH:mm:ss ZZZZZ',
+])
+def test_parse_datetime_format_datetime_roundtrip(fmt):
+    dt = datetime(2024, 3, 10, 7, 30, tzinfo=UTC)
+    string = dates.format_datetime(dt, fmt, locale='en_US')
+    assert dates.parse_datetime(string, fmt, locale='en_US', tzinfo=UTC) == dt
+
+
+def test_parse_datetime_format_datetime_roundtrip_other_locale():
+    dt = datetime(2024, 3, 10, 7, 30)
+    fmt = 'd. MMMM yyyy, HH:mm'
+    string = dates.format_datetime(dt, fmt, locale='de')
+    assert string == '10. März 2024, 07:30'
+    assert dates.parse_datetime(string, fmt, locale='de') == dt
+
+
+def test_parse_datetime_format_datetime_roundtrip_with_zone():
+    eastern = dates.get_timezone('America/New_York')
+    dt = datetime(2024, 7, 1, 12, 0, tzinfo=eastern)
+    fmt = "yyyy-MM-dd'T'HH:mm:ssXXX"
+    string = dates.format_datetime(dt, fmt, locale='en_US')
+    assert string == '2024-07-01T12:00:00-04:00'
+    assert dates.parse_datetime(string, fmt, locale='en_US') == dt
+
+
+def test_parse_datetime_tzinfo_naive_by_default():
+    parsed = dates.parse_datetime('2024-04-01 15:30', 'yyyy-MM-dd HH:mm', locale='en_US')
+    assert parsed == datetime(2024, 4, 1, 15, 30)
+    assert parsed.tzinfo is None
+    eastern = dates.get_timezone('America/New_York')
+    parsed = dates.parse_datetime('2024-04-01 15:30', 'yyyy-MM-dd HH:mm',
+                                  locale='en_US', tzinfo=eastern)
+    assert parsed.tzinfo is eastern
+    assert parsed.utcoffset() == timedelta(hours=-4)
+
+
+def test_parse_datetime_dst_ambiguous():
+    eastern = dates.get_timezone('America/New_York')
+    fmt = 'yyyy-MM-dd HH:mm'
+    # 2024-11-03 01:30 occurs twice in America/New_York (EDT and EST)
+    with pytest.raises(dates.ParseError, match='ambiguous'):
+        dates.parse_datetime('2024-11-03 01:30', fmt, locale='en_US', tzinfo=eastern)
+    earlier = dates.parse_datetime('2024-11-03 01:30', fmt, locale='en_US',
+                                   tzinfo=eastern, ambiguous='earlier')
+    later = dates.parse_datetime('2024-11-03 01:30', fmt, locale='en_US',
+                                 tzinfo=eastern, ambiguous='later')
+    assert earlier.utcoffset() == timedelta(hours=-4)  # EDT
+    assert later.utcoffset() == timedelta(hours=-5)  # EST
+    # distinct instants, one hour apart (compare in UTC: datetimes sharing
+    # a tzinfo would otherwise be compared by wall-clock time)
+    assert earlier.astimezone(UTC) < later.astimezone(UTC)
+    assert later.astimezone(UTC) - earlier.astimezone(UTC) == timedelta(hours=1)
+
+
+def test_parse_datetime_dst_nonexistent():
+    eastern = dates.get_timezone('America/New_York')
+    fmt = 'yyyy-MM-dd HH:mm'
+    # 2024-03-10 02:30 never occurs in America/New_York (spring forward)
+    with pytest.raises(dates.ParseError, match='does not exist'):
+        dates.parse_datetime('2024-03-10 02:30', fmt, locale='en_US', tzinfo=eastern)
+    forward = dates.parse_datetime('2024-03-10 02:30', fmt, locale='en_US',
+                                   tzinfo=eastern, nonexistent='shift_forward')
+    backward = dates.parse_datetime('2024-03-10 02:30', fmt, locale='en_US',
+                                    tzinfo=eastern, nonexistent='shift_backward')
+    assert forward.replace(tzinfo=None) == datetime(2024, 3, 10, 3, 30)
+    assert forward.utcoffset() == timedelta(hours=-4)  # EDT
+    assert backward.replace(tzinfo=None) == datetime(2024, 3, 10, 1, 30)
+    assert backward.utcoffset() == timedelta(hours=-5)  # EST
+
+
+def test_parse_datetime_invalid_dst_parameters():
+    with pytest.raises(ValueError, match='ambiguous'):
+        dates.parse_datetime('2024-04-01', 'yyyy-MM-dd', locale='en_US',
+                             tzinfo=UTC, ambiguous='bogus')
+    with pytest.raises(ValueError, match='nonexistent'):
+        dates.parse_datetime('2024-04-01', 'yyyy-MM-dd', locale='en_US',
+                             tzinfo=UTC, nonexistent='bogus')
 
 
 @pytest.mark.parametrize('case', ['', 'a', 'aaa'])
