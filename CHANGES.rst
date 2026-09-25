@@ -28,6 +28,9 @@ Bugfixes
 * Core: Improve handling of no-inheritance-marker in timezone data by @akx in :gh:`1194`
 * Core: Make the number pattern regular expression more efficient by @akx in :gh:`1213`
 * Messages: Keep translator comments next to the translation function call by @akx in :gh:`1196`
+* Messages: Python extraction no longer partially extracts dynamic expressions such as
+  ``gettext("a" + user + "b")``; only statically determinable text (adjacent string literals,
+  including within grouping parentheses, and f-strings without replacement fields) is extracted
 * Numbers: Fix KeyError that occurred when formatting compact currencies of exactly one thousand in several locales  by @bartbroere in :gh:`1246`
 
 Other improvements

@@ -505,3 +505,91 @@ _('Armin'))
     assert messages[6][3] == []
     assert messages[7][2] == 'Armin'
     assert messages[7][3] == []
+
+
+def test_dynamic_expression_not_extracted():
+    buf = BytesIO(b"""\
+msg1 = gettext("a" + user + "b")
+msg2 = gettext("b" + user)
+msg3 = gettext(user + "c")
+msg4 = gettext("static")
+""")
+    messages = list(extract.extract_python(buf, extract.DEFAULT_KEYWORDS.keys(), [], {}))
+    # Dynamic expressions must not be partially extracted, and must not
+    # swallow the static call that follows them.
+    assert messages == [
+        (1, 'gettext', None, []),
+        (2, 'gettext', None, []),
+        (3, 'gettext', None, []),
+        (4, 'gettext', 'static', []),
+    ]
+
+
+def test_parenthesized_concatenated_strings():
+    buf = BytesIO(b"""\
+msg1 = gettext(("a" "b"))
+msg2 = gettext((
+    "multi"
+    "line"
+))
+msg3 = gettext(("a" "b" + user))
+""")
+    messages = list(extract.extract_python(buf, extract.DEFAULT_KEYWORDS.keys(), [], {}))
+    assert messages == [
+        (1, 'gettext', 'ab', []),
+        (3, 'gettext', 'multiline', []),
+        (6, 'gettext', None, []),
+    ]
+
+
+def test_dynamic_arguments_keep_keyword_positions():
+    buf = BytesIO(b"""\
+msg1 = ngettext("a" + user, "bunnies", count)
+msg2 = ngettext("bunny", "bunnies" + suffix, count)
+msg3 = dpgettext("dev", "Strings", "pylon" + suffix)
+""")
+    messages = list(extract.extract_python(buf, extract.DEFAULT_KEYWORDS.keys(), [], {}))
+    assert messages == [
+        (1, 'ngettext', (None, 'bunnies', None), []),
+        (2, 'ngettext', ('bunny', None, None), []),
+        (3, 'dpgettext', ('dev', 'Strings', None), []),
+    ]
+    # The keyword specs require the dynamic positions, so nothing is extracted.
+    buf.seek(0)
+    assert list(extract.extract('python', buf)) == []
+
+
+def test_mixed_dynamic_and_static_calls():
+    # Expectation catalog for a single file containing nested calls,
+    # multi-line translator comments and truly dynamic f-strings: only
+    # statically determinable text may be extracted, and no subsequent
+    # call may be swallowed.
+    buf = BytesIO(b"""\
+# NOTE: outer call comment
+# NOTE: spanning two lines
+msg1 = ngettext(gettext("nested"), "nested plurals", count)
+msg2 = gettext("a" + user + "b")
+msg3 = gettext(f"dynamic {user}")
+msg4 = gettext(f"static")
+msg5 = gettext(("paren" "thesized"))
+# NOTE: trailing comment
+msg6 = gettext("after dynamic")
+""")
+    messages = list(extract.extract_python(buf, extract.DEFAULT_KEYWORDS.keys(), ['NOTE:'], {}))
+    assert messages == [
+        # The nested call ends the outer call; the comments stay with it.
+        (None, 'ngettext', None, ['NOTE: outer call comment', 'NOTE: spanning two lines']),
+        (3, 'gettext', 'nested', []),
+        (4, 'gettext', None, []),
+        (5, 'gettext', None, []),
+        (6, 'gettext', 'static', []),
+        (7, 'gettext', 'parenthesized', []),
+        (9, 'gettext', 'after dynamic', ['NOTE: trailing comment']),
+    ]
+    buf.seek(0)
+    assert list(extract.extract('python', buf, comment_tags=['NOTE:'])) == [
+        (3, 'nested', [], None),
+        (6, 'static', [], None),
+        (7, 'parenthesized', [], None),
+        (9, 'after dynamic', ['NOTE: trailing comment'], None),
+    ]

@@ -566,12 +566,18 @@ def extract_python(
     :rtype: ``iterator``
     """
     funcname = lineno = message_lineno = None
-    call_stack = []  # line numbers of calls
+    call_stack = []  # (line number, opaque) of parenthesized groups in calls
     buf = []
     messages = []
     translator_comments = []
     in_def = in_translator_comments = False
     comment_tag = None
+    # Whether the current argument contains anything but string literals,
+    # i.e. it is not statically determinable and must not be extracted.
+    arg_dynamic = False
+    # The previous significant token, used to tell function calls apart
+    # from parenthesized groups of string literals.
+    prev_token = None
 
     encoding = parse_encoding(fileobj) or options.get('encoding', 'UTF-8')
     future_flags = parse_future_flags(fileobj, encoding)
@@ -593,7 +599,18 @@ def extract_python(
                 in_def = False
                 continue
             if funcname:
-                call_stack.append(lineno)
+                # A parenthesis directly following a name (or a closing
+                # bracket) belongs to a call such as `foo(...)` whose
+                # contents are not part of the message; anything else is
+                # a grouping parenthesis that may contain plain string
+                # literal concatenation, e.g. `_("foo" "bar")`.
+                opaque = bool(call_stack) and (
+                    prev_token is not None
+                    and (prev_token[0] == NAME or prev_token[1] in (')', ']'))
+                )
+                if opaque:
+                    arg_dynamic = True
+                call_stack.append((lineno, opaque))
         elif in_def and tok == OP and value == ':':
             # End of a class definition without parens
             in_def = False
@@ -612,20 +629,25 @@ def extract_python(
                     in_translator_comments = True
                     translator_comments.append((lineno, value))
                     break
-        elif funcname and len(call_stack) == 1:
-            nested = tok == NAME and value in keywords
-            if (tok == OP and value == ')') or nested:
-                if buf:
+        elif funcname and call_stack:
+            nested = tok == NAME and value in keywords and len(call_stack) == 1
+            if (tok == OP and value == ')' and len(call_stack) == 1) or nested:
+                if buf and not arg_dynamic:
                     messages.append(''.join(buf))
-                    del buf[:]
                 else:
                     messages.append(None)
+                del buf[:]
+                arg_dynamic = False
 
                 messages = tuple(messages) if len(messages) > 1 else messages[0]
 
                 if translator_comments:
                     last_comment_lineno = translator_comments[-1][0]
-                    if last_comment_lineno < min(message_lineno, call_stack[-1]) - 1:
+                    # A nested call may end the current call before any
+                    # message text was seen; fall back to the line where
+                    # the parenthesis token to start this call is.
+                    first_lineno = message_lineno if message_lineno is not None else call_stack[-1][0]
+                    if last_comment_lineno < min(first_lineno, call_stack[-1][0]) - 1:
                         # Comments don't apply unless they immediately
                         # precede the message, or the line where the parenthesis token
                         # to start this message's translation call is.
@@ -645,18 +667,42 @@ def extract_python(
                 in_translator_comments = False
                 if nested:
                     funcname = value
+            elif tok == OP and value == ')':
+                call_stack.pop()
+            elif tok == OP and value == ',' and len(call_stack) == 1:
+                if buf and not arg_dynamic:
+                    messages.append(''.join(buf))
+                else:
+                    messages.append(None)
+                del buf[:]
+                arg_dynamic = False
+                if translator_comments:
+                    # We have translator comments, and since we're on a
+                    # comma(,) user is allowed to break into a new line
+                    # Let's increase the last comment's lineno in order
+                    # for the comment to still be a valid one
+                    old_lineno, old_comment = translator_comments.pop()
+                    translator_comments.append((old_lineno + 1, old_comment))
             elif tok == STRING:
-                val = _parse_python_string(value, encoding, future_flags)
-                if val is not None:
-                    if not message_lineno:
-                        message_lineno = lineno
-                    buf.append(val)
+                # A string inside a nested call, e.g. the "bar" in
+                # _(foo("bar")), is not part of the message.
+                if not any(opaque for _, opaque in call_stack):
+                    val = _parse_python_string(value, encoding, future_flags)
+                    if val is not None:
+                        if not message_lineno:
+                            message_lineno = lineno
+                        buf.append(val)
+                    else:
+                        # A string token that is not a static string constant
+                        # (e.g. an f-string with replacement fields).
+                        arg_dynamic = True
 
             # Python 3.12+, see https://peps.python.org/pep-0701/#new-tokens
             elif tok == FSTRING_START:
-                current_fstring_start = value
-                if not message_lineno:
-                    message_lineno = lineno
+                if not any(opaque for _, opaque in call_stack):
+                    current_fstring_start = value
+                    if not message_lineno:
+                        message_lineno = lineno
             elif tok == FSTRING_MIDDLE:
                 if current_fstring_start is not None:
                     current_fstring_start += value
@@ -666,25 +712,16 @@ def extract_python(
                     val = _parse_python_string(fstring, encoding, future_flags)
                     if val is not None:
                         buf.append(val)
+                    else:
+                        arg_dynamic = True
 
-            elif tok == OP and value == ',':
-                if buf:
-                    messages.append(''.join(buf))
-                    del buf[:]
-                else:
-                    messages.append(None)
-                if translator_comments:
-                    # We have translator comments, and since we're on a
-                    # comma(,) user is allowed to break into a new line
-                    # Let's increase the last comment's lineno in order
-                    # for the comment to still be a valid one
-                    old_lineno, old_comment = translator_comments.pop()
-                    translator_comments.append((old_lineno + 1, old_comment))
-
-            elif tok != NL and not message_lineno:
-                message_lineno = lineno
-        elif len(call_stack) > 1 and tok == OP and value == ')':
-            call_stack.pop()
+            elif tok not in (NL, COMMENT):
+                # Anything else (names, operators, numbers, ...) means the
+                # argument is not a plain string literal, so it cannot be
+                # extracted statically.
+                arg_dynamic = True
+                if not message_lineno:
+                    message_lineno = lineno
         elif funcname and not call_stack:
             funcname = None
         elif tok == NAME and value in keywords:
@@ -696,6 +733,9 @@ def extract_python(
             # And if it's FSTRING_END, we've already handled it above.
             # Let's forget that we're in an f-string.
             current_fstring_start = None
+
+        if tok != NL:
+            prev_token = (tok, value)
 
 
 def _parse_python_string(value: str, encoding: str, future_flags: int) -> str | None:
