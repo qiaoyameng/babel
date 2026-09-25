@@ -10,6 +10,7 @@
 # individuals. For the exact contribution history, see the revision
 # history and logs, available at https://github.com/python-babel/babel/commits/master/.
 
+import re
 from datetime import datetime
 from io import BytesIO
 
@@ -20,7 +21,12 @@ from babel.core import Locale, UnknownLocaleError
 from babel.dates import format_datetime
 from babel.messages import Message, checkers
 from babel.messages.catalog import TranslationError
-from babel.messages.checkers import _validate_format, python_format
+from babel.messages.checkers import (
+    _validate_brace_format,
+    _validate_format,
+    python_brace_format,
+    python_format,
+)
 from babel.messages.plurals import PLURALS
 from babel.messages.pofile import read_po
 from babel.util import LOCALTZ
@@ -416,3 +422,111 @@ def test__validate_format_invalid(msgid, msgstr, error):
 )
 def test__validate_format_valid(msgid, msgstr):
     _validate_format(msgid, msgstr)
+
+
+@pytest.mark.parametrize(
+    ('msgid', 'msgstr'),
+    [
+        # placeholders dropped, added or rewritten
+        ('Hello {name}!', 'Hallo!'),
+        ('Hello {name}!', 'Hallo {name} und {name2}!'),
+        ('{0} {1}', '{0}'),
+        ('{0} {1}', '{0} {1} {2}'),
+        ('{user.name}', '{user.title}'),
+        ('{0[0]}', '{0[1]}'),
+        # placeholders nested in the format spec
+        ('{0:{width}}', '{0}'),
+        ('{0:{width}}', '{0:{height}}'),
+        # conversion changed
+        ('{0!r}', '{0!s}'),
+        ('{0!r}', '{0}'),
+        ('{0}', '{0!a}'),
+        # incompatible presentation types
+        ('{0:d}', '{0:s}'),
+        ('{0:d}', '{0:f}'),
+        ('{0:f}', '{0:x}'),
+        ('{0:d}', '{0}'),
+        ('{0}', '{0:d}'),
+        # mixed automatic and manual field numbering
+        ('{0} {}', '{0} {}'),
+        ('{} {0}', '{} {0}'),
+        ('{0} {1}', '{0} {}'),
+        # invalid format strings
+        ('{0}', 'broken }'),
+        ('{0}', 'broken {'),
+        # plural messages: each translated form is checked
+        (('{0} apple', '{0} apples'), ('{0} Apfel', 'Äpfel')),
+        (('{0} apple', '{0} apples'), ('{0} Apfel', '{0} Äpfel', 'no apples')),
+    ],
+)
+def test_python_brace_format_invalid(msgid, msgstr):
+    msg = Message(msgid, msgstr)
+    assert 'python-brace-format' in msg.flags
+    with pytest.raises(TranslationError):
+        python_brace_format(None, msg)
+
+
+@pytest.mark.parametrize(
+    ('msgid', 'msgstr'),
+    [
+        ('Hello {name}!', 'Hallo {name}!'),
+        # placeholders may be reordered
+        ('{0} {1}', '{1} {0}'),
+        ('{name} {age}', '{age} und {name}'),
+        ('{} {}', '{} {}'),
+        ('{} {}', '{1} {0}'),
+        # doubled braces are literal text
+        ('{{{name}}}', '{{{name}}}'),
+        # attribute and item access
+        ('{user.name} {0[1]}', '{0[1]} {user.name}'),
+        # compatible presentation types
+        ('{0:d}', '{0:x}'),
+        ('{0:f}', '{0:g}'),
+        ('{0}', '{0:s}'),
+        ('{0:.2f}', '{0:.3f}'),
+        ('{0:>10}', '{0:<20}'),
+        # placeholders nested in the format spec
+        ('{0:{width}}', '{0:{width}}'),
+        ('{0:{width}.{prec}f}', '{0:{prec}.{width}f}'),
+        ('{:{}}', '{:{}}'),
+        # empty translations are skipped
+        ('{0} apples', ''),
+        (('{0} apple', '{0} apples'), ('', '')),
+        (('{0} apple', '{0} apples'), ('{0} Apfel', '')),
+        (('{0} apple', '{0} apples'), ('{0} Apfel', '{0} Äpfel')),
+    ],
+)
+def test_python_brace_format_valid(msgid, msgstr):
+    msg = Message(msgid, msgstr)
+    assert 'python-brace-format' in msg.flags
+    python_brace_format(None, msg)
+
+
+def test_python_brace_format_not_flagged():
+    # messages without the flag are not checked
+    msg = Message('no placeholders', 'keine {0}')
+    assert 'python-brace-format' not in msg.flags
+    python_brace_format(None, msg)
+
+
+@pytest.mark.parametrize(
+    ('msgid', 'msgstr', 'error'),
+    [
+        ('Hello {name}!', 'Hallo!', "placeholder 'name' is missing in the translation"),
+        ('Hello!', 'Hallo {name}!', "unknown placeholder 'name'"),
+        ('{0} {1}', '{1}', "placeholder '0' is missing in the translation"),
+        ('{0}', '{1}', "placeholder '0' is missing in the translation"),
+        ('{0} {1}', '{0} {1} {2}', "unknown placeholder '2'"),
+        ('{user.name}', '{user.title}', "placeholder 'user.name' is missing in the translation"),
+        ('{0:{width}}', '{0}', "placeholder 'width' is missing in the translation"),
+        ('{0!r}', '{0!s}', "placeholder '0' uses conversion '!s' but the original uses conversion '!r'"),
+        ('{0!r}', '{0}', "placeholder '0' uses no conversion but the original uses conversion '!r'"),
+        ('{0:d}', '{0:s}', "incompatible format for placeholder '0': 's' and 'd' are not compatible"),
+        ('{0} {}', '{0} {}', 'cannot switch from manual field numbering to automatic field numbering'),
+        ('{} {0}', '{} {0}', 'cannot switch from automatic field numbering to manual field numbering'),
+        ('{0}', 'broken }', "invalid format string: Single '}' encountered in format string"),
+    ],
+)
+def test__validate_brace_format_invalid(msgid, msgstr, error):
+    with pytest.raises(TranslationError, match=re.escape(error)):
+        _validate_brace_format(msgid, msgstr)
