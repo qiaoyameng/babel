@@ -841,6 +841,207 @@ def format_currency(
     )
 
 
+def format_currency_range(
+    start: float | decimal.Decimal | str,
+    end: float | decimal.Decimal | str,
+    currency: str,
+    format: str | NumberPattern | None = None,
+    locale: Locale | str | None = None,
+    currency_digits: bool = True,
+    format_type: Literal["name", "standard", "accounting"] = "standard",
+    decimal_quantization: bool = True,
+    group_separator: bool = True,
+    *,
+    numbering_system: Literal["default"] | str = "latn",
+    range_separator: str = '\u2013',
+) -> str:
+    """Return a short, locale-aware formatted currency range.
+
+    When both endpoints are non-negative and share the same currency, the
+    currency marker is only rendered once, around the whole range:
+
+    >>> format_currency_range(1099.98, 2500, 'USD', locale='en_US')
+    '$1,099.98\\u20132,500.00'
+    >>> format_currency_range(1099.98, 2500, 'EUR', locale='de_DE')
+    '1.099,98\\u20132.500,00\\xa0\\u20ac'
+    >>> format_currency_range(1099.98, 2500, 'EGP', locale='ar_EG', numbering_system='default')
+    '\\u200f1\\u066c099\\u066b98\\u20132\\u066c500\\u066b00\\xa0\\u062c.\\u0645.\\u200f'
+
+    The collapse is structural: the locale's currency pattern is decomposed
+    into prefix and suffix, and only the numeric cores of the endpoints are
+    joined with the range separator.  Locale data such as non-breaking
+    spaces and bidirectional control marks is therefore preserved as-is.
+
+    If the range crosses a sign boundary, or the negative sub-pattern uses
+    different markers (such as the parentheses of accounting formats), both
+    endpoints are formatted in full so no information is lost:
+
+    >>> format_currency_range(-5, 5, 'USD', locale='en_US')
+    '-$5.00\\u2013$5.00'
+    >>> format_currency_range(-5, 5, 'USD', locale='en_US', format_type='accounting')
+    '($5.00)\\u2013$5.00'
+
+    If both endpoints are equal, or become equal after rounding to the
+    currency's precision, a single value is returned:
+
+    >>> format_currency_range(3, 3, 'USD', locale='en_US')
+    '$3.00'
+    >>> format_currency_range(3.001, 3.004, 'USD', locale='en_US')
+    '$3.00'
+
+    NaN, infinite and reversed ranges are rejected:
+
+    >>> format_currency_range(float('nan'), 5, 'USD', locale='en_US')
+    Traceback (most recent call last):
+        ...
+    ValueError: Cannot format NaN as a currency range.
+    >>> format_currency_range(5, 1, 'USD', locale='en_US')
+    Traceback (most recent call last):
+        ...
+    ValueError: Invalid currency range: start (5) is greater than end (1).
+
+    :param start: the lower bound of the range.
+    :param end: the upper bound of the range.
+    :param currency: the currency code.
+    :param format: the format string to use.
+    :param locale: the `Locale` object or locale identifier.
+                   Defaults to the system currency locale or numeric locale.
+    :param currency_digits: use the currency's natural number of decimal digits.
+    :param format_type: the currency format type to use.
+    :param decimal_quantization: Truncate and round high-precision numbers to
+                                 the format pattern. Defaults to `True`.
+    :param group_separator: Boolean to switch group separator on/off in a locale's
+                            number format.
+    :param numbering_system: The numbering system used for formatting number symbols. Defaults to "latn".
+                             The special value "default" will use the default numbering system of the locale.
+    :param range_separator: The string placed between the two endpoints.
+                            Defaults to the EN DASH (U+2013) used by the CLDR
+                            root range pattern.
+    :raise `UnknownCurrencyFormatError`: If the currency format type is not known.
+    :raise `UnsupportedNumberingSystemError`: If the numbering system is not supported by the locale.
+    :raise `ValueError`: If an endpoint is NaN or infinite, or if the range
+                         is reversed.
+    """
+    locale = Locale.parse(locale or LC_MONETARY)
+
+    if not isinstance(start, decimal.Decimal):
+        start = decimal.Decimal(str(start))
+    if not isinstance(end, decimal.Decimal):
+        end = decimal.Decimal(str(end))
+    for value in (start, end):
+        if value.is_nan():
+            raise ValueError('Cannot format NaN as a currency range.')
+        if value.is_infinite():
+            raise ValueError('Cannot format infinity as a currency range.')
+    if start > end:
+        raise ValueError(
+            f'Invalid currency range: start ({start}) is greater than end ({end}).',
+        )
+
+    if format:
+        pattern = parse_pattern(format)
+    elif format_type == 'name':
+        pattern = parse_pattern(locale.decimal_formats[None])
+    else:
+        try:
+            pattern = locale.currency_formats[format_type]
+        except KeyError:
+            raise UnknownCurrencyFormatError(
+                f"{format_type!r} is not a known currency format type",
+            ) from None
+
+    # Round the endpoints the same way NumberPattern.apply() would, so that
+    # equality and sign decisions below match the rendered output.
+    if currency_digits:
+        frac_prec = (get_currency_precision(currency),) * 2
+    else:
+        frac_prec = pattern.frac_prec
+    if decimal_quantization:
+        quantum = get_decimal_quantum(frac_prec[1])
+        quantized_start = start.quantize(quantum)
+        quantized_end = end.quantize(quantum)
+    else:
+        quantized_start, quantized_end = start, end
+    # A quantized negative zero must not select the negative sub-pattern.
+    if quantized_start == 0:
+        quantized_start = quantized_start.copy_abs()
+    if quantized_end == 0:
+        quantized_end = quantized_end.copy_abs()
+
+    def _format_single(value: decimal.Decimal) -> str:
+        return format_currency(
+            value,
+            currency,
+            format=format,
+            locale=locale,
+            currency_digits=currency_digits,
+            format_type=format_type,
+            decimal_quantization=decimal_quantization,
+            group_separator=group_separator,
+            numbering_system=numbering_system,
+        )
+
+    if start == end:
+        # The range is a single value.
+        return _format_single(start)
+    if quantized_start == quantized_end:
+        # The endpoints only differ beyond the rendered precision.
+        return _format_single(quantized_start)
+
+    if (
+        format_type == 'name'
+        or quantized_start.is_signed()
+        or quantized_end.is_signed()
+    ):
+        # The endpoints carry different signs (or use the long display
+        # name), so each side keeps its own full currency marker.
+        return range_separator.join((
+            _format_single(start),
+            _format_single(end),
+        ))
+
+    # Both endpoints are non-negative: strip the pattern down to its numeric
+    # core and wrap the joined cores in the pattern's prefix and suffix, so
+    # the currency marker is rendered exactly once.
+    core_pattern = NumberPattern(
+        pattern.pattern,
+        ('', ''),
+        ('', ''),
+        pattern.grouping,
+        pattern.int_prec,
+        pattern.frac_prec,
+        pattern.exp_prec,
+        pattern.exp_plus,
+        pattern.number_pattern,
+    )
+    core_kwargs: dict[str, Any] = {
+        'currency': currency,
+        'currency_digits': currency_digits,
+        'decimal_quantization': decimal_quantization,
+        'group_separator': group_separator,
+        'numbering_system': numbering_system,
+    }
+    start_text = core_pattern.apply(quantized_start, locale, **core_kwargs)
+    end_text = core_pattern.apply(quantized_end, locale, **core_kwargs)
+
+    retval = ''.join((
+        pattern.prefix[0],
+        start_text,
+        range_separator,
+        end_text,
+        pattern.suffix[0],
+    ))
+
+    if '\xa4' in retval:
+        retval = retval.replace('\xa4\xa4\xa4', get_currency_name(currency, quantized_end, locale))
+        retval = retval.replace('\xa4\xa4', currency.upper())
+        retval = retval.replace('\xa4', get_currency_symbol(currency, locale))
+
+    # remove single quotes around text, except for doubled single quotes
+    # which are replaced with a single quote
+    return re.sub(r"'([^']*)'", lambda m: m.group(1) or "'", retval)
+
+
 def _format_currency_long_name(
     number: float | decimal.Decimal | str,
     currency: str,

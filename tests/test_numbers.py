@@ -307,6 +307,97 @@ def test_format_currency_format_type():
             == '1.099,98')
 
 
+def test_format_currency_range():
+    # Symbol-before locale: the currency marker is rendered only once.
+    assert (numbers.format_currency_range(1, 5, 'USD', locale='en_US')
+            == '$1.00\u20135.00')
+    assert (numbers.format_currency_range(1099.98, 2500, 'USD', locale='en_US')
+            == '$1,099.98\u20132,500.00')
+    # Symbol-after locale: the non-breaking space and symbol wrap the range.
+    assert (numbers.format_currency_range(1099.98, 2500, 'EUR', locale='de_DE')
+            == '1.099,98\u20132.500,00\xa0\u20ac')
+    # RTL locale: bidi control marks and non-breaking space are preserved.
+    assert (numbers.format_currency_range(1099.98, 2500, 'EGP', locale='ar_EG',
+                                          numbering_system='default')
+            == '\u200f1\u066c099\u066b98\u20132\u066c500\u066b00\xa0\u062c.\u0645.\u200f')
+    assert (numbers.format_currency_range(1099.98, 2500, 'EUR', locale='he_IL')
+            == '\u200f1,099.98\u20132,500.00\xa0\u200f\u20ac')
+
+
+def test_format_currency_range_sign_boundary():
+    # Crossing a sign boundary keeps both currency markers.
+    assert (numbers.format_currency_range(-5, 5, 'USD', locale='en_US')
+            == '-$5.00\u2013$5.00')
+    assert (numbers.format_currency_range(-5, -1, 'USD', locale='en_US')
+            == '-$5.00\u2013-$1.00')
+    # Accounting parentheses are kept on the negative side.
+    assert (numbers.format_currency_range(-5, 5, 'USD', locale='en_US',
+                                          format_type='accounting')
+            == '($5.00)\u2013$5.00')
+    assert (numbers.format_currency_range(-5, -1, 'USD', locale='en_US',
+                                          format_type='accounting')
+            == '($5.00)\u2013($1.00)')
+    # A tiny negative endpoint rounding to zero is not rendered as negative.
+    assert (numbers.format_currency_range('-0.004', 5, 'USD', locale='en_US')
+            == '$0.00\u20135.00')
+
+
+def test_format_currency_range_single_value():
+    # Identical endpoints collapse to a single value.
+    assert (numbers.format_currency_range(3, 3, 'USD', locale='en_US')
+            == '$3.00')
+    assert (numbers.format_currency_range(2, 2, 'USD', locale='en_US', format_type='name')
+            == numbers.format_currency(2, 'USD', locale='en_US', format_type='name'))
+    # Endpoints equal after rounding to the currency's precision.
+    assert (numbers.format_currency_range('3.001', '3.004', 'USD', locale='en_US')
+            == '$3.00')
+    assert (numbers.format_currency_range('-0.001', '0.001', 'USD', locale='en_US')
+            == '$0.00')
+
+
+def test_format_currency_range_invalid():
+    with pytest.raises(ValueError, match='NaN'):
+        numbers.format_currency_range(float('nan'), 5, 'USD', locale='en_US')
+    with pytest.raises(ValueError, match='NaN'):
+        numbers.format_currency_range(1, decimal.Decimal('nan'), 'USD', locale='en_US')
+    with pytest.raises(ValueError, match='infinity'):
+        numbers.format_currency_range(1, float('inf'), 'USD', locale='en_US')
+    with pytest.raises(ValueError, match='infinity'):
+        numbers.format_currency_range(float('-inf'), 5, 'USD', locale='en_US')
+    with pytest.raises(ValueError, match='greater than end'):
+        numbers.format_currency_range(5, 1, 'USD', locale='en_US')
+    with pytest.raises(numbers.UnknownCurrencyFormatError):
+        numbers.format_currency_range(1, 5, 'USD', locale='en_US', format_type='unknown')
+
+
+def test_format_currency_range_options():
+    # The currency's natural precision is used by default.
+    assert (numbers.format_currency_range(100, 200, 'JPY', locale='en_US')
+            == '\xa5100\u2013200')
+    assert (numbers.format_currency_range(100.4, 200, 'JPY', locale='en_US',
+                                          currency_digits=False)
+            == '\xa5100.40\u2013200.00')
+    # Explicit format strings are honored.
+    assert (numbers.format_currency_range(1, 5, 'EUR', '\xa4\xa4 #,##0.00', locale='en_US')
+            == 'EUR 1.00\u20135.00')
+    # Group separators can be switched off.
+    assert (numbers.format_currency_range(1234, 5678, 'USD', locale='en_US',
+                                          group_separator=False)
+            == '$1234.00\u20135678.00')
+    # A custom range separator can be requested.
+    assert (numbers.format_currency_range(1, 5, 'USD', locale='en_US',
+                                          range_separator='~')
+            == '$1.00~5.00')
+    # Long display names keep the full marker on both sides.
+    assert (numbers.format_currency_range(1, 5, 'USD', locale='en_US',
+                                          format_type='name')
+            == '1.00 US dollar\u20135.00 US dollars')
+    # Quantization can be disabled.
+    assert (numbers.format_currency_range('1.234', '5.678', 'USD', locale='en_US',
+                                          decimal_quantization=False)
+            == '$1.234\u20135.678')
+
+
 def test_format_compact_currency():
     assert numbers.format_compact_currency(1, 'USD', locale='en_US', format_type="short") == '$1'
     assert numbers.format_compact_currency(999, 'USD', locale='en_US', format_type="short") == '$999'
