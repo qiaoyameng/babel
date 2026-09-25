@@ -10,12 +10,20 @@
 # individuals. For the exact contribution history, see the revision
 # history and logs, available at https://github.com/python-babel/babel/commits/master/.
 
+import ast
 import codecs
+import sys
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 
 from babel.messages import extract
+
+
+DYNAMIC_CONCAT_DATA = (
+    Path(__file__).parent / 'data' / 'keyword_arguments_dynamic_concat'
+)
 
 
 def test_nested_calls():
@@ -505,3 +513,197 @@ _('Armin'))
     assert messages[6][3] == []
     assert messages[7][2] == 'Armin'
     assert messages[7][3] == []
+
+
+def test_dynamic_concatenation_is_not_partially_extracted():
+    buf = BytesIO(b"""\
+msg1 = gettext("a" + user + "b")
+msg2 = gettext("a" "b")
+msg3 = gettext(("a" + user))
+msg4 = gettext("Hello {name}".format(name=name))
+msg5 = gettext("Hello " % name)
+msg6 = gettext(messages[0])
+msg7 = gettext({"k": "v"})
+msg8 = gettext(["a", "b"])
+msg9 = gettext(user.thing)
+""")
+    messages = list(extract.extract_python(buf, ('gettext',), [], {}))
+    assert messages == [
+        (1, 'gettext', None, []),
+        (2, 'gettext', 'ab', []),
+        (3, 'gettext', None, []),
+        (4, 'gettext', None, []),
+        (5, 'gettext', None, []),
+        (6, 'gettext', None, []),
+        (7, 'gettext', None, []),
+        (8, 'gettext', None, []),
+        (9, 'gettext', None, []),
+    ]
+
+
+def test_dynamic_concatenation_does_not_swallow_following_calls():
+    buf = BytesIO(b"""\
+msg1 = gettext("a" + user + "b")
+msg2 = gettext("good")
+msg3 = ngettext('one' + x, 'two', n)
+msg4 = _('after')
+""")
+    messages = list(extract.extract_python(
+        buf, extract.DEFAULT_KEYWORDS.keys(), [], {},
+    ))
+    assert messages == [
+        (1, 'gettext', None, []),
+        (2, 'gettext', 'good', []),
+        (3, 'ngettext', ('one' and None or None,), []) if False else (3, 'ngettext', (None, 'two', None), []),
+        (4, '_', 'after', []),
+    ]
+
+
+def test_parenthesized_static_concatenation_is_extracted():
+    buf = BytesIO(b"""\
+msg1 = gettext(('a' + 'b'))
+msg2 = gettext(('a' 'b'))
+msg3 = gettext((('a') + ('b')))
+msg4 = gettext('a' + 'b')
+msg5 = gettext('a' 'b')
+msg6 = gettext(
+    'a'
+    +
+    'b'
+)
+""")
+    messages = list(extract.extract_python(buf, ('gettext',), [], {}))
+    assert [message[2] for message in messages] == [
+        'ab', 'ab', 'ab', 'ab', 'ab', 'ab',
+    ]
+    # The reported line is the line of the first token of the argument.
+    # For the trailing multiline call that is the line after the opening
+    # parenthesis.
+    assert [message[0] for message in messages] == [1, 2, 3, 4, 5, 7]
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason='Pre-3.12 tokenizers report f-strings as single STRING tokens',
+)
+def test_dynamic_fstring_is_not_partially_extracted():
+    buf = BytesIO(b"""\
+msg1 = gettext(f'a{x}b')
+msg2 = gettext('a' f'b{x}' 'c')
+msg3 = gettext(f'a{"b"}c')
+msg4 = gettext(f'{f("inner")}')
+msg5 = gettext(f'a{x}' + 'c')
+msg6 = gettext(f'plain')
+msg7 = gettext(f'a' 'b')
+msg8 = gettext(f'{{escaped}}')
+msg9 = gettext('after')
+""")
+    messages = list(extract.extract_python(buf, ('gettext',), [], {}))
+    assert messages == [
+        (1, 'gettext', None, []),
+        (2, 'gettext', None, []),
+        (3, 'gettext', None, []),
+        (4, 'gettext', None, []),
+        (5, 'gettext', None, []),
+        (6, 'gettext', 'plain', []),
+        (7, 'gettext', 'ab', []),
+        (8, 'gettext', '{escaped}', []),
+        (9, 'gettext', 'after', []),
+    ]
+
+
+def test_dynamic_argument_lineno_and_comments_are_preserved():
+    buf = BytesIO(b"""\
+# NOTE: leading comment
+# NOTE: second line
+msg1 = gettext(
+    "a" + user + "b",
+)
+msg2 = ngettext(
+    "one thing",
+    "many " + things,
+    count,
+)
+""")
+    messages = list(extract.extract_python(buf, ('gettext', 'ngettext'), ['NOTE:'], {}))
+    # The reported line is the one of the first argument token, which is on
+    # the line after the opening parenthesis.
+    assert messages[0] == (
+        4, 'gettext', (None, None),
+        ['NOTE: leading comment', 'NOTE: second line'],
+    )
+    assert messages[1] == (7, 'ngettext', ('one thing', None, None, None), [])
+
+
+def test_keyword_specs_are_applied_with_dynamic_arguments():
+    buf = BytesIO(b"""\
+msg1 = pgettext('context', 'a' + user)
+msg2 = pgettext('context', 'message')
+msg3 = dpgettext('domain', 'context', 'a' + user)
+msg4 = npgettext('context', 'one' + x, 'two', n)
+msg5 = npgettext('context', 'one', 'two', n)
+""")
+    messages = list(extract.extract('python', buf, extract.DEFAULT_KEYWORDS, [], {}))
+    assert messages == [
+        (2, 'message', [], 'context'),
+        (5, ('one', 'two'), [], 'context'),
+    ]
+
+
+def test_nested_call_with_static_arguments_does_not_leak():
+    buf = BytesIO(b"""\
+msg1 = _(something.method('a', 'b'))
+msg2 = _('after')
+msg3 = add(_('first'), _('second'))
+""")
+    messages = list(extract.extract_python(
+        buf, ('_',), [], {},
+    ))
+    assert messages == [
+        (1, '_', None, []),
+        (2, '_', 'after', []),
+        (3, '_', 'first', []),
+        (3, '_', 'second', []),
+    ]
+
+
+def _expected_lines(section):
+    expected_path = DYNAMIC_CONCAT_DATA / 'expected.txt'
+    lines = expected_path.read_text(encoding='utf-8').splitlines()
+    start = lines.index(section) + 1
+    end = start
+    while end < len(lines) and lines[end] and not lines[end].startswith('==='):
+        end += 1
+    return [line for line in lines[start:end] if line]
+
+
+def test_dynamic_concatenation_fixture_directory():
+    # One single fixture file exercises nested calls, multiline translator
+    # comments and genuinely dynamic f-strings.  The expected results live
+    # next to the fixture and assert that nothing dynamic is over-extracted
+    # and that calls following the dynamic ones are not swallowed.
+    fixture = DYNAMIC_CONCAT_DATA / 'messages.py'
+
+    with fixture.open('rb') as fileobj:
+        raw = list(extract.extract_python(
+            fileobj, extract.DEFAULT_KEYWORDS.keys(), ['TRANSLATORS:'], {},
+        ))
+    raw_expected = [
+        ast.literal_eval(line)
+        for line in _expected_lines(
+            '=== extract_python (lineno, funcname, messages, comments) ===',
+        )
+    ]
+    assert raw == raw_expected
+
+    with fixture.open('rb') as fileobj:
+        filtered = list(extract.extract(
+            'python', fileobj, extract.DEFAULT_KEYWORDS, ['TRANSLATORS:'], {},
+        ))
+    filtered_expected = [
+        ast.literal_eval(line)
+        for line in _expected_lines(
+            '=== extract (lineno, messages, comments, context) ===',
+        )
+    ]
+    assert filtered == filtered_expected

@@ -579,21 +579,36 @@ def extract_python(
 
     tokens = generate_tokens(next_line)
 
-    # Current prefix of a Python 3.12 (PEP 701) f-string, or None if we're not
-    # currently parsing one.
-    current_fstring_start = None
+    # Stack of PEP 701 f-strings currently being parsed (Python 3.12+).
+    # Each entry is [prefix, brace_depth, has_field]: the f-string text
+    # accumulated so far, the nesting depth of its replacement fields
+    # (``{...}``), and whether any such field was actually opened.  Escaped
+    # braces (``{{``/``}}``) never open a field, as they arrive as
+    # FSTRING_MIDDLE tokens.
+    fstrings: list[list] = []
+    # Parenthesized/bracketed groups *inside* the current call, as a stack
+    # of opening operators (``(``, ``[`` or ``{``).  Only strings enclosed
+    # solely by parentheses are eligible for static extraction; square or
+    # curly brackets (subscripts, lists, sets, dicts, ...) make an argument
+    # dynamic.
+    groups: list[str] = []
+    # True once the current argument contains something that cannot be
+    # resolved to a static literal (a name, a non-parenthesized group, a
+    # real replacement field, an operator other than ``+`` between
+    # literals, ...).  Such an argument is emitted as ``None`` instead of
+    # joining the literal pieces that happen to appear in it.
+    argument_is_dynamic = False
 
     for tok, value, (lineno, _), _, _ in tokens:
+        in_fstring_expression = bool(fstrings) and fstrings[-1][1] > 0
+
         if not call_stack and tok == NAME and value in ('def', 'class'):
             in_def = True
-        elif tok == OP and value == '(':
-            if in_def:
-                # Avoid false positives for declarations such as:
-                # def gettext(arg='message'):
-                in_def = False
-                continue
-            if funcname:
-                call_stack.append(lineno)
+        elif in_def and tok == OP and value == '(':
+            # Avoid false positives for declarations such as:
+            # def gettext(arg='message'):
+            in_def = False
+            continue
         elif in_def and tok == OP and value == ':':
             # End of a class definition without parens
             in_def = False
@@ -612,14 +627,30 @@ def extract_python(
                     in_translator_comments = True
                     translator_comments.append((lineno, value))
                     break
-        elif funcname and len(call_stack) == 1:
-            nested = tok == NAME and value in keywords
-            if (tok == OP and value == ')') or nested:
-                if buf:
+        elif funcname and not call_stack and tok == OP and value == '(':
+            # Opening parenthesis of the translation call itself.
+            call_stack.append(lineno)
+        elif funcname and call_stack and tok == OP and value == '(' and not in_fstring_expression:
+            # A grouping parenthesis (possibly wrapping static literal
+            # concatenation, as in ``_(('a' + 'b'))``) or the argument list
+            # of a regular nested call such as ``_(foo('a'))``: stay in the
+            # current call and treat the contents statically if possible.
+            groups.append('(')
+            continue
+        elif funcname and call_stack:
+            nested_keyword = (
+                tok == NAME
+                and value in keywords
+                and not groups
+                and not in_fstring_expression
+            )
+            if (tok == OP and value == ')' and not groups and not in_fstring_expression) or nested_keyword:
+                if buf and not argument_is_dynamic:
                     messages.append(''.join(buf))
-                    del buf[:]
                 else:
                     messages.append(None)
+                del buf[:]
+                argument_is_dynamic = False
 
                 messages = tuple(messages) if len(messages) > 1 else messages[0]
 
@@ -640,39 +671,94 @@ def extract_python(
 
                 funcname = lineno = message_lineno = None
                 call_stack.clear()
+                groups.clear()
+                fstrings.clear()
+                argument_is_dynamic = False
                 messages = []
                 translator_comments = []
                 in_translator_comments = False
-                if nested:
+                if nested_keyword:
                     funcname = value
+
+            # Python 3.12+, see https://peps.python.org/pep-0701/#new-tokens
+            elif tok == FSTRING_START:
+                fstrings.append([value, 0, False])
+                if not message_lineno:
+                    message_lineno = lineno
+            elif tok == FSTRING_MIDDLE:
+                if fstrings:
+                    # Literal braces inside middle segments were unescaped by
+                    # the tokenizer; double them again so that the rebuilt
+                    # f-string source keeps their literal meaning.
+                    fstrings[-1][0] += value.replace('{', '{{').replace('}', '}}')
+            elif tok == OP and value == '{':
+                if fstrings:
+                    # Opening brace of an f-string replacement field (or a
+                    # nested dict/set literal inside one).
+                    fstrings[-1][1] += 1
+                    fstrings[-1][2] = True
+                else:
+                    groups.append('{')
+                    argument_is_dynamic = True
+            elif tok == OP and value == '}' and fstrings:
+                fstrings[-1][1] -= 1
+            elif tok == OP and value == '}' and not in_fstring_expression:
+                if groups and groups[-1] == '{':
+                    groups.pop()
+            elif tok == FSTRING_END:
+                if fstrings:
+                    prefix, _brace_depth, has_field = fstrings.pop()
+                    fstring = prefix + value
+                    val = _parse_python_string(fstring, encoding, future_flags)
+                    if val is not None and not has_field:
+                        # Static f-string without replacement fields (the
+                        # parser also folds purely constant joined strings;
+                        # escaped braces such as ``f'{{x}}'`` arrive inside
+                        # FSTRING_MIDDLE and never set the field flag).
+                        buf.append(val)
+                    else:
+                        # A real replacement field makes the f-string
+                        # dynamic, even if the literals around it look like
+                        # they could be joined; drop everything collected so
+                        # far and mark the argument dynamic.
+                        argument_is_dynamic = True
+                        del buf[:]
+                if not message_lineno:
+                    message_lineno = lineno
+            elif in_fstring_expression:
+                # Other tokens inside an f-string replacement field never
+                # contribute to the (necessarily dynamic) message; brace
+                # bookkeeping for them was done above.
+                pass
+            elif tok == OP and value == '[':
+                groups.append('[')
+                argument_is_dynamic = True
+            elif tok == OP and value == ']':
+                if groups and groups[-1] == '[':
+                    groups.pop()
+            elif tok == OP and value == ')':
+                if groups and groups[-1] == '(':
+                    groups.pop()
             elif tok == STRING:
                 val = _parse_python_string(value, encoding, future_flags)
                 if val is not None:
                     if not message_lineno:
                         message_lineno = lineno
-                    buf.append(val)
-
-            # Python 3.12+, see https://peps.python.org/pep-0701/#new-tokens
-            elif tok == FSTRING_START:
-                current_fstring_start = value
-                if not message_lineno:
-                    message_lineno = lineno
-            elif tok == FSTRING_MIDDLE:
-                if current_fstring_start is not None:
-                    current_fstring_start += value
-            elif tok == FSTRING_END:
-                if current_fstring_start is not None:
-                    fstring = current_fstring_start + value
-                    val = _parse_python_string(fstring, encoding, future_flags)
-                    if val is not None:
+                    if not groups or all(group == '(' for group in groups):
                         buf.append(val)
-
-            elif tok == OP and value == ',':
-                if buf:
+                elif _is_fstring_token(value):
+                    # On Python versions without PEP 701 tokenization, a
+                    # dynamic f-string (one with replacement fields) arrives
+                    # as a single STRING token.  It makes the argument
+                    # dynamic, so adjacent literals must not be joined.
+                    argument_is_dynamic = True
+            elif tok == OP and value == ',' and not groups:
+                if buf and not argument_is_dynamic:
                     messages.append(''.join(buf))
-                    del buf[:]
                 else:
                     messages.append(None)
+                del buf[:]
+                argument_is_dynamic = False
                 if translator_comments:
                     # We have translator comments, and since we're on a
                     # comma(,) user is allowed to break into a new line
@@ -681,21 +767,38 @@ def extract_python(
                     old_lineno, old_comment = translator_comments.pop()
                     translator_comments.append((old_lineno + 1, old_comment))
 
-            elif tok != NL and not message_lineno:
-                message_lineno = lineno
-        elif len(call_stack) > 1 and tok == OP and value == ')':
-            call_stack.pop()
+            elif tok in {NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.COMMENT}:
+                # Whitespace, blank lines and comments inside a call do not
+                # make an argument dynamic.
+                pass
+            elif tok == OP and value == '+' and (buf or groups):
+                # ``+`` between static literals (possibly parenthesized, as in
+                # ``('a' + 'b')``) is a compile-time constant fold, so it is
+                # accepted but contributes nothing itself.
+                pass
+            else:
+                # Anything else -- names, numbers, calls, operators such as
+                # ``%``/``.format``/``*args``/... -- cannot be resolved
+                # without executing the source, so the argument is dynamic.
+                argument_is_dynamic = True
+                if not message_lineno:
+                    message_lineno = lineno
         elif funcname and not call_stack:
             funcname = None
         elif tok == NAME and value in keywords:
             funcname = value
 
-        if current_fstring_start is not None and tok not in {FSTRING_START, FSTRING_MIDDLE}:
-            # In Python 3.12, tokens other than FSTRING_* mean the
-            # f-string is dynamic, so we don't wan't to extract it.
-            # And if it's FSTRING_END, we've already handled it above.
-            # Let's forget that we're in an f-string.
-            current_fstring_start = None
+
+def _is_fstring_token(value: str) -> bool:
+    """Return whether ``value`` is a source representation of an f-string.
+
+    This is only needed on Python versions whose tokenizer reports f-strings
+    as single ``STRING`` tokens (before PEP 701 in Python 3.12).
+    """
+    quote_positions = [pos for pos in (value.find("'"), value.find('"')) if pos >= 0]
+    if not quote_positions:
+        return False
+    return 'f' in value[: min(quote_positions)].lower()
 
 
 def _parse_python_string(value: str, encoding: str, future_flags: int) -> str | None:
