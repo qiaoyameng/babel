@@ -1,0 +1,42 @@
+# German translations for DemoProject.
+# Copyright (C) 2025 DemoOrg
+# This file is distributed under the same license as the DemoProject project.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2025.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: DemoProject 1.0\n"
+"Report-Msgid-Bugs-To: bugs@example.com\n"
+"POT-Creation-Date: 2025-01-01 12:00+0000\n"
+"PO-Revision-Date: 2025-04-01 12:00+0000\n"
+"Last-Translator: Alice <alice@example.com>\n"
+"Language: de\n"
+"Language-Team: German Team <german@example.com>\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+# Greeting shown on startup.
+#: main.py:1 util.py:5
+msgid "hello"
+msgstr "Hallo"
+
+#: app.py:10
+msgctxt "menu"
+msgid "quit"
+msgstr "Schliessen"
+
+#: fruit.py:3
+msgid "apple"
+msgid_plural "apples"
+msgstr[0] "Apfel!"
+msgstr[1] "Aepfel!"
+
+#: legacy.py:9
+msgid "legacy"
+msgstr "Altlast (neu)"
+
+#. No longer used.
+#~ msgid "old_feature"
+#~ msgstr "Alte Funktion"

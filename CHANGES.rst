@@ -19,6 +19,10 @@ Features
 * Messages: Merge in per-format keywords and auto_comments by @akx in :gh:`1243`
 * Messages: Update keywords for extraction of dpgettext and dnpgettext by @mardiros in :gh:`1235`
 * Messages: Validate all plurals in Python format checker by @tomasr8 in :gh:`1188`
+* Messages: Add three-way catalog merging via ``babel.messages.merge.merge_catalogs``,
+  which aligns messages by ID and context, auto-merges non-overlapping edits and
+  reports structured conflicts for diverged translations, plural-form count changes,
+  delete-vs-modify edits, obsolete message resurrections and header metadata
 * Time: Use standard library `timezone` instead of `FixedOffsetTimezone` by @akx in :gh:`1203`
 
 Bugfixes

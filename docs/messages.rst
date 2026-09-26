@@ -424,3 +424,41 @@ more productive.
 .. note:: Whether translator comments can be extracted depends on the extraction
           method in use. The Python extractor provided by Babel does implement
           this feature, but others may not.
+
+
+-------------------------
+Three-Way Catalog Merges
+-------------------------
+
+When two translation branches both modify the same PO file, the changes can
+be reconciled with a three-way merge based on their common ancestor:
+
+.. code-block:: python
+
+    from babel.messages.merge import merge_catalogs
+    from babel.messages.pofile import read_po
+
+    with open('base.po') as f:
+        base = read_po(f)
+    with open('ours.po') as f:
+        ours = read_po(f)
+    with open('theirs.po') as f:
+        theirs = read_po(f)
+
+    merged, conflicts = merge_catalogs(base, ours, theirs)
+
+Messages are aligned by message ID and context, and the merge happens per
+message and per field rather than per file:
+
+* if one side changed the translation while the other changed comments,
+  flags or locations, both changes are merged automatically;
+* if both sides changed the same translation differently, a
+  :class:`~babel.messages.merge.MergeConflict` is recorded and the merged
+  message keeps the base translation, marked fuzzy -- neither side's
+  translation is used as the final result;
+* plural translations with a changed number of forms, delete-vs-modify
+  edits, resurrected obsolete messages and header metadata are each
+  handled separately.
+
+When ``conflicts`` is empty, the merged catalog can be written out and
+read back unchanged.  See ``misc/three-way-merge/`` for a runnable example.
