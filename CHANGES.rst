@@ -1,6 +1,18 @@
 Babel Changelog
 ===============
 
+Unreleased
+----------
+
+Features
+~~~~~~~~
+
+* Dates: Add `babel.dates.parse_datetime()`, a `format_datetime()` counterpart
+  that parses numeric date/time fields, localized month names, AM/PM markers
+  and numeric timezone offsets, validates real calendar dates, consumes the
+  entire input, and resolves DST-ambiguous and nonexistent local times via
+  explicit ``ambiguous``/``nonexistent`` policies.
+
 Version 2.18.0
 --------------
 

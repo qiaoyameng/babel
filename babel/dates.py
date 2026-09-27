@@ -1390,6 +1390,343 @@ def parse_time(
     return datetime.time(hour, minute, second)
 
 
+def _get_month_names_dict(locale: Locale) -> dict[str, set[int]]:
+    """Map all localized month names (any width or context) to month numbers."""
+    names: dict[str, set[int]] = {}
+    for context in ('format', 'stand-alone'):
+        for width in ('wide', 'abbreviated', 'narrow'):
+            for month, name in get_month_names(width, context, locale).items():
+                names.setdefault(name.casefold(), set()).add(month)
+    return names
+
+
+def _get_period_names_dict(locale: Locale) -> dict[str, str]:
+    """Map all localized AM/PM names (any width or context) to "am"/"pm"."""
+    periods: dict[str, str] = {}
+    for context in ('format', 'stand-alone'):
+        for width in ('wide', 'abbreviated', 'narrow'):
+            names = get_period_names(width, context, locale)
+            for period in ('am', 'pm'):
+                if period in names:
+                    periods.setdefault(names[period].casefold(), period)
+    return periods
+
+
+def _names_alternation(names: Iterable[str]) -> str:
+    """Build a regular expression alternation matching any of the given names."""
+    return '|'.join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+
+
+#: A numeric timezone offset such as "+02", "+0200", "+02:00" or "GMT+02:00".
+_TZ_OFFSET_PATTERN = r'(?:GMT|UTC)?[+-]\d{2}(?::?\d{2})?'
+
+
+def _parse_timezone_offset(value: str) -> datetime.timedelta:
+    """Parse a numeric timezone offset into a `datetime.timedelta`."""
+    if value in ('Z', 'z'):
+        return datetime.timedelta(0)
+    match = re.fullmatch(
+        r'(?:GMT|UTC)?([+-])(\d{2})(?::?(\d{2}))?', value, flags=re.IGNORECASE,
+    )
+    if match is None:
+        raise ParseError(f"Could not parse timezone offset {value!r}")
+    sign, hours, minutes = match.groups()
+    hours, minutes = int(hours), int(minutes or 0)
+    if hours > 23 or minutes > 59:
+        raise ParseError(f"Invalid timezone offset {value!r}")
+    delta = datetime.timedelta(hours=hours, minutes=minutes)
+    return -delta if sign == '-' else delta
+
+
+def _resolve_local_time(
+    dt: datetime.datetime,
+    tzinfo: datetime.tzinfo,
+    ambiguous: str,
+    nonexistent: str,
+) -> datetime.datetime:
+    """Attach `tzinfo` to the naive datetime `dt`, resolving DST edge cases.
+
+    Ambiguous (repeated) and nonexistent (skipped) local times are handled
+    according to the `ambiguous` and `nonexistent` policies; no silent
+    guessing is performed.
+    """
+    if hasattr(tzinfo, 'localize'):  # pytz-style timezone
+        candidates = [
+            tzinfo.localize(dt, is_dst=False),
+            tzinfo.localize(dt, is_dst=True),
+        ]
+    else:  # PEP 495 compatible timezone (zoneinfo, datetime.timezone, ...)
+        candidates = [
+            dt.replace(tzinfo=tzinfo, fold=0),
+            dt.replace(tzinfo=tzinfo, fold=1),
+        ]
+
+    valid: dict[datetime.timedelta, datetime.datetime] = {}
+    shifted: set[datetime.datetime] = set()
+    for candidate in candidates:
+        round_tripped = candidate.astimezone(UTC).astimezone(tzinfo)
+        if round_tripped.replace(tzinfo=None) == dt:
+            valid.setdefault(candidate.utcoffset(), candidate)
+        else:
+            shifted.add(round_tripped)
+
+    if len(valid) > 1:
+        if ambiguous == 'raise':
+            raise ParseError(
+                f"{dt!r} is ambiguous in timezone {tzinfo!r}; "
+                f"pass ambiguous='earlier' or ambiguous='later' to choose "
+                f"one of the occurrences",
+            )
+        ordered = sorted(valid.values(), key=lambda c: c.astimezone(UTC))
+        return ordered[0] if ambiguous == 'earlier' else ordered[-1]
+    if valid:
+        return next(iter(valid.values()))
+
+    if nonexistent == 'raise':
+        raise ParseError(
+            f"{dt!r} does not exist in timezone {tzinfo!r}; "
+            f"pass nonexistent='shift_forward' or nonexistent='shift_backward' "
+            f"to choose the closest valid time",
+        )
+    ordered = sorted(shifted, key=lambda c: c.replace(tzinfo=None))
+    return ordered[-1] if nonexistent == 'shift_forward' else ordered[0]
+
+
+def parse_datetime(
+    string: str,
+    format: _PredefinedTimeFormat | str | DateTimePattern,
+    locale: Locale | str | None = None,
+    tzinfo: datetime.tzinfo | str | None = None,
+    *,
+    ambiguous: Literal['raise', 'earlier', 'later'] = 'raise',
+    nonexistent: Literal['raise', 'shift_forward', 'shift_backward'] = 'raise',
+) -> datetime.datetime:
+    """Parse a datetime from a string according to the given format pattern.
+
+    This is the counterpart of `format_datetime`: it is meant for reading
+    back timestamps that the application itself has written, e.g. in log
+    files.  The entire input string must be consumed by the format, and the
+    parsed values are validated against the real calendar; the order of the
+    fields is taken from the pattern, never guessed.
+
+    >>> parse_datetime('2024-04-01 15:30:00', 'yyyy-MM-dd HH:mm:ss', locale='en_US')
+    datetime.datetime(2024, 4, 1, 15, 30)
+
+    Month names and AM/PM markers are matched against the locale's data:
+
+    >>> parse_datetime('Apr 1, 2024, 3:30 PM', 'MMM d, y, h:mm a', locale='en_US')
+    datetime.datetime(2024, 4, 1, 15, 30)
+    >>> parse_datetime('1. April 2024', 'd. MMMM y', locale='de_DE')
+    datetime.datetime(2024, 4, 1, 0, 0)
+
+    A numeric timezone offset in the input is kept as-is:
+
+    >>> parse_datetime('2024-04-01 15:30 +0200', 'yyyy-MM-dd HH:mm Z', locale='en_US')
+    datetime.datetime(2024, 4, 1, 15, 30, tzinfo=datetime.timezone(datetime.timedelta(seconds=7200)))
+
+    Dates that do not exist in the calendar are rejected:
+
+    >>> parse_datetime('2023-02-29', 'yyyy-MM-dd', locale='en_US')
+    Traceback (most recent call last):
+    ...
+    ParseError: Invalid date/time components parsed from '2023-02-29': ...
+
+    If the input has no offset of its own, `tzinfo` is attached instead.
+    Local times that are ambiguous or nonexistent because of a DST
+    transition raise an error unless an explicit choice is made:
+
+    >>> tz = get_timezone('America/New_York')
+    >>> parse_datetime('2024-11-03 01:30', 'yyyy-MM-dd HH:mm', locale='en_US', tzinfo=tz)
+    Traceback (most recent call last):
+    ...
+    ParseError: ...is ambiguous in timezone...
+    >>> parse_datetime('2024-11-03 01:30', 'yyyy-MM-dd HH:mm', locale='en_US',
+    ...                tzinfo=tz, ambiguous='earlier').strftime('%Y-%m-%d %H:%M %z')
+    '2024-11-03 01:30 -0400'
+    >>> parse_datetime('2024-03-10 02:30', 'yyyy-MM-dd HH:mm', locale='en_US',
+    ...                tzinfo=tz, nonexistent='shift_forward').strftime('%Y-%m-%d %H:%M %z')
+    '2024-03-10 03:30 -0400'
+
+    Pattern tokens that are not supported yet are reported explicitly:
+
+    >>> parse_datetime('2024-04-01', "yyyy-MM-dd E", locale='en_US')
+    Traceback (most recent call last):
+    ...
+    ParseError: parse_datetime() does not support the pattern token 'E'...
+
+    The supported pattern tokens are ``y`` (year), ``M``/``L`` (numeric or
+    named month), ``d`` (day of month), ``H``/``h`` (24/12-hour), ``m``
+    (minute), ``s`` (second), ``a`` (AM/PM marker) and ``Z``/``X``/``x``/``O``
+    (numeric timezone offset).
+
+    .. versionadded:: 2.19
+
+    :param string: the string containing the datetime
+    :param format: the format pattern to parse with, either an explicit
+                   date/time pattern, a `DateTimePattern`, or one of
+                   "full", "long", "medium", or "short" (see
+                   ``get_datetime_format``)
+    :param locale: a `Locale` object or a locale identifier. Defaults to the
+                   system time locale.
+    :param tzinfo: the timezone to attach when the input does not contain a
+                   numeric offset; may be a `tzinfo` object or a timezone
+                   name.  Ignored when the input contains an offset.
+    :param ambiguous: how to handle local times that occur twice because of
+                      a DST transition: "raise" (the default), "earlier", or
+                      "later"
+    :param nonexistent: how to handle local times that are skipped because of
+                        a DST transition: "raise" (the default),
+                        "shift_forward", or "shift_backward"
+    :return: the parsed datetime
+    :rtype: `datetime`
+    """
+    if ambiguous not in ('raise', 'earlier', 'later'):
+        raise ValueError(
+            f"Invalid 'ambiguous' value {ambiguous!r}; "
+            f"expected 'raise', 'earlier' or 'later'",
+        )
+    if nonexistent not in ('raise', 'shift_forward', 'shift_backward'):
+        raise ValueError(
+            f"Invalid 'nonexistent' value {nonexistent!r}; "
+            f"expected 'raise', 'shift_forward' or 'shift_backward'",
+        )
+
+    locale = Locale.parse(locale or LC_TIME)
+    if isinstance(format, DateTimePattern):
+        pattern = format.pattern
+    elif format in ('full', 'long', 'medium', 'short'):
+        joint = str(get_datetime_format(format, locale=locale)).replace("'", "")
+        pattern = joint.replace(
+            '{0}', str(get_time_format(format, locale=locale)),
+        ).replace(
+            '{1}', str(get_date_format(format, locale=locale)),
+        )
+    else:
+        pattern = format
+
+    month_names = _get_month_names_dict(locale)
+    period_names = _get_period_names_dict(locale)
+
+    handlers: list[tuple[str, str, int | None]] = []
+    regex_parts: list[str] = []
+    for token_type, token_value in tokenize_pattern(pattern):
+        if token_type == 'chars':
+            regex_parts.append(re.escape(token_value))
+            continue
+        char, num = token_value
+        group = f'f{len(handlers)}'
+        if char == 'y':
+            regex = r'\d{2}' if num == 2 else r'\d+'
+            field, extra = 'year', num
+        elif char in 'ML':
+            if num <= 2:
+                regex, field, extra = r'\d{1,2}', 'month', None
+            else:
+                regex, field, extra = _names_alternation(month_names), 'month_name', None
+        elif char == 'd':
+            regex, field, extra = r'\d{1,2}', 'day', None
+        elif char == 'H':
+            regex, field, extra = r'\d{1,2}', 'hour', None
+        elif char == 'h':
+            regex, field, extra = r'\d{1,2}', 'hour12', None
+        elif char == 'm':
+            regex, field, extra = r'\d{1,2}', 'minute', None
+        elif char == 's':
+            regex, field, extra = r'\d{1,2}', 'second', None
+        elif char == 'a':
+            regex, field, extra = _names_alternation(period_names), 'period', None
+        elif char in 'ZXxO':
+            regex = _TZ_OFFSET_PATTERN if char == 'x' else f'Z|{_TZ_OFFSET_PATTERN}'
+            field, extra = 'offset', None
+        else:
+            raise ParseError(
+                f"parse_datetime() does not support the pattern token {char!r} "
+                f"(in pattern {pattern!r}); supported tokens are: "
+                f"y, M, L, d, H, h, m, s, a, Z, X, x, O",
+            )
+        regex_parts.append(f'(?P<{group}>{regex})')
+        handlers.append((group, field, extra))
+
+    match = re.fullmatch(''.join(regex_parts), string, flags=re.IGNORECASE)
+    if match is None:
+        raise ParseError(
+            f"Could not parse {string!r} with format {pattern!r}; "
+            f"the entire input must be matched by the format",
+        )
+
+    year = month = day = None
+    hour = minute = second = 0
+    hour12 = period = offset = None
+    seen: set[str] = set()
+    for group, field, extra in handlers:
+        canonical = {'month_name': 'month', 'hour12': 'hour'}.get(field, field)
+        if canonical in seen:
+            raise ParseError(
+                f"The pattern {pattern!r} contains the field {canonical!r} more than once",
+            )
+        seen.add(canonical)
+        text = match.group(group)
+        if field == 'year':
+            year = int(text)
+            if extra == 2:
+                year += 2000
+        elif field == 'month':
+            month = int(text)
+        elif field == 'month_name':
+            months = month_names[text.casefold()]
+            if len(months) > 1:
+                raise ParseError(
+                    f"Ambiguous month name {text!r} in {string!r}",
+                )
+            month = months.pop()
+        elif field == 'day':
+            day = int(text)
+        elif field == 'hour':
+            hour = int(text)
+        elif field == 'hour12':
+            hour12 = int(text)
+        elif field == 'minute':
+            minute = int(text)
+        elif field == 'second':
+            second = int(text)
+        elif field == 'period':
+            period = period_names[text.casefold()]
+        elif field == 'offset':
+            offset = _parse_timezone_offset(text)
+
+    if year is None or month is None or day is None:
+        raise ParseError(
+            f"The format {pattern!r} must contain a year ('y'), "
+            f"a month ('M' or 'L') and a day of month ('d') token",
+        )
+    if hour12 is not None:
+        if not 1 <= hour12 <= 12:
+            raise ParseError(f"Invalid 12-hour value {hour12} in {string!r}")
+        hour = hour12 % 12
+        if period == 'pm':
+            hour += 12
+    elif period is not None:
+        raise ParseError(
+            f"The period token 'a' in {pattern!r} requires a 12-hour token ('h')",
+        )
+
+    try:
+        dt = datetime.datetime(year, month, day, hour, minute, second)
+    except ValueError as exc:
+        raise ParseError(
+            f"Invalid date/time components parsed from {string!r}: {exc}",
+        ) from None
+
+    if offset is not None:
+        # An offset in the input always wins over the `tzinfo` argument.
+        return dt.replace(tzinfo=datetime.timezone(offset))
+    if tzinfo is None:
+        return dt
+    if isinstance(tzinfo, str):
+        tzinfo = get_timezone(tzinfo)
+    return _resolve_local_time(dt, tzinfo, ambiguous, nonexistent)
+
+
 class DateTimePattern:
     def __init__(self, pattern: str, format: DateTimeFormat):
         self.pattern = pattern

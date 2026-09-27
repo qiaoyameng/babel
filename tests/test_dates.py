@@ -536,6 +536,198 @@ def test_parse_errors(case, func):
         func(case, locale='en_US')
 
 
+def test_parse_datetime():
+    assert dates.parse_datetime(
+        '2024-04-01 15:30:22', 'yyyy-MM-dd HH:mm:ss', locale='en_US',
+    ) == datetime(2024, 4, 1, 15, 30, 22)
+    # The field order comes from the pattern, never from guessing:
+    assert dates.parse_datetime(
+        '01.02.2024', 'dd.MM.yyyy', locale='de_DE',
+    ) == datetime(2024, 2, 1)
+    assert dates.parse_datetime(
+        '01/02/2024', 'MM/dd/yyyy', locale='en_US',
+    ) == datetime(2024, 1, 2)
+    # Two-digit years:
+    assert dates.parse_datetime(
+        '01.04.24', 'dd.MM.yy', locale='de_DE',
+    ) == datetime(2024, 4, 1)
+
+
+def test_parse_datetime_month_names():
+    assert dates.parse_datetime(
+        'Apr 1, 2024', 'MMM d, y', locale='en_US',
+    ) == datetime(2024, 4, 1)
+    assert dates.parse_datetime(
+        '1. April 2024', 'd. MMMM y', locale='de_DE',
+    ) == datetime(2024, 4, 1)
+    # Stand-alone month names ('L') work as well:
+    assert dates.parse_datetime(
+        '1. huhtikuu 2024', 'd. LLLL y', locale='fi_FI',
+    ) == datetime(2024, 4, 1)
+
+
+@pytest.mark.parametrize(('input', 'expected'), [
+    ('3:30 AM', time(3, 30)),
+    ('3:30 PM', time(15, 30)),
+    ('12:00 AM', time(0, 0)),   # midnight
+    ('12:00 PM', time(12, 0)),  # noon
+    ('12:30 am', time(0, 30)),
+    ('12:30 pM', time(12, 30)),
+])
+def test_parse_datetime_am_pm(input, expected):
+    assert dates.parse_datetime(
+        f'2024-04-01 {input}', 'yyyy-MM-dd h:mm a', locale='en_US',
+    ) == datetime.combine(date(2024, 4, 1), expected)
+
+
+def test_parse_datetime_am_pm_requires_12h_token():
+    with pytest.raises(dates.ParseError, match="requires a 12-hour token"):
+        dates.parse_datetime(
+            '2024-04-01 15:30 PM', 'yyyy-MM-dd HH:mm a', locale='en_US',
+        )
+
+
+def test_parse_datetime_timezone_offset():
+    parsed = dates.parse_datetime(
+        '2024-04-01 15:30 +0200', 'yyyy-MM-dd HH:mm Z', locale='en_US',
+    )
+    assert parsed.utcoffset() == timedelta(hours=2)
+    parsed = dates.parse_datetime(
+        '2024-04-01 15:30 GMT-07:00', 'yyyy-MM-dd HH:mm ZZZZ', locale='en_US',
+    )
+    assert parsed.utcoffset() == timedelta(hours=-7)
+    parsed = dates.parse_datetime(
+        '2024-04-01T15:30:00Z', "yyyy-MM-dd'T'HH:mm:ssX", locale='en_US',
+    )
+    assert parsed.utcoffset() == timedelta(0)
+    parsed = dates.parse_datetime(
+        '2024-04-01 15:30+05:30', 'yyyy-MM-dd HH:mmXXX', locale='en_US',
+    )
+    assert parsed.utcoffset() == timedelta(hours=5, minutes=30)
+    # An offset in the input wins over the tzinfo argument:
+    parsed = dates.parse_datetime(
+        '2024-04-01 15:30 +0900', 'yyyy-MM-dd HH:mm Z', locale='en_US',
+        tzinfo=dates.get_timezone('America/New_York'),
+    )
+    assert parsed.utcoffset() == timedelta(hours=9)
+
+
+def test_parse_datetime_format_datetime_roundtrip():
+    dt = datetime(2024, 4, 1, 15, 30, 22, tzinfo=UTC)
+    formats = [
+        'yyyy-MM-dd HH:mm:ss',
+        'yyyy-MM-dd HH:mm:ss Z',
+        'yyyy-MM-dd HH:mm:ss ZZZZ',
+        "yyyy-MM-dd'T'HH:mm:ssX",
+        'MMM d, y, h:mm:ss a',
+        'd. MMMM y, HH:mm:ss',
+    ]
+    for fmt in formats:
+        for locale in ('en_US', 'de_DE', 'fi_FI', 'zh_Hans'):
+            string = dates.format_datetime(dt, fmt, locale=locale)
+            parsed = dates.parse_datetime(string, fmt, locale=locale)
+            assert parsed.replace(tzinfo=None) == dt.replace(tzinfo=None)
+            if 'Z' in fmt or 'X' in fmt:
+                assert parsed.utcoffset() == dt.utcoffset()
+
+
+def test_parse_datetime_predefined_format():
+    dt = datetime(2024, 4, 1, 15, 30, 22)
+    string = dates.format_datetime(dt, 'medium', locale='en_US')
+    assert dates.parse_datetime(string, 'medium', locale='en_US') == dt
+
+
+@pytest.mark.parametrize('string', [
+    '2023-02-29',  # not a leap year
+    '2024-02-30',  # February never has 30 days
+    '2024-04-31',  # April has 30 days
+    '2024-13-01',  # no 13th month
+    '2024-04-00',  # no day zero
+])
+def test_parse_datetime_invalid_calendar_date(string):
+    with pytest.raises(dates.ParseError, match='Invalid date/time'):
+        dates.parse_datetime(string, 'yyyy-MM-dd', locale='en_US')
+
+
+def test_parse_datetime_leap_day():
+    assert dates.parse_datetime(
+        '2024-02-29', 'yyyy-MM-dd', locale='en_US',
+    ) == datetime(2024, 2, 29)
+
+
+@pytest.mark.parametrize('string', [
+    '2024-04-01 15:30:00 junk',  # trailing garbage
+    'junk 2024-04-01',           # leading garbage
+    '2024-04-01 15:30',          # incomplete input
+    '2024/04/01',                # wrong separators
+])
+def test_parse_datetime_unconsumed_input(string):
+    with pytest.raises(dates.ParseError, match='entire input'):
+        dates.parse_datetime(string, 'yyyy-MM-dd HH:mm:ss', locale='en_US')
+
+
+@pytest.mark.parametrize('fmt', [
+    'yyyy-MM-dd E',           # weekday
+    'yyyy-MM-dd z',           # timezone name
+    'yyyy-MM-dd HH:mm:ss.SSS',  # fractional seconds
+    'yyyy-QQQ',               # quarter
+])
+def test_parse_datetime_unsupported_token(fmt):
+    with pytest.raises(dates.ParseError, match='does not support the pattern token'):
+        dates.parse_datetime('whatever', fmt, locale='en_US')
+
+
+def test_parse_datetime_ambiguous_local_time():
+    tz = dates.get_timezone('America/New_York')  # 2024-11-03 01:30 happens twice
+    with pytest.raises(dates.ParseError, match='is ambiguous'):
+        dates.parse_datetime('2024-11-03 01:30', 'yyyy-MM-dd HH:mm',
+                             locale='en_US', tzinfo=tz)
+    earlier = dates.parse_datetime('2024-11-03 01:30', 'yyyy-MM-dd HH:mm',
+                                   locale='en_US', tzinfo=tz, ambiguous='earlier')
+    later = dates.parse_datetime('2024-11-03 01:30', 'yyyy-MM-dd HH:mm',
+                                 locale='en_US', tzinfo=tz, ambiguous='later')
+    assert earlier.utcoffset() == timedelta(hours=-4)
+    assert later.utcoffset() == timedelta(hours=-5)
+    assert earlier.astimezone(UTC) < later.astimezone(UTC)
+
+
+def test_parse_datetime_nonexistent_local_time():
+    tz = dates.get_timezone('America/New_York')  # 2024-03-10 02:30 never happens
+    with pytest.raises(dates.ParseError, match='does not exist'):
+        dates.parse_datetime('2024-03-10 02:30', 'yyyy-MM-dd HH:mm',
+                             locale='en_US', tzinfo=tz)
+    forward = dates.parse_datetime('2024-03-10 02:30', 'yyyy-MM-dd HH:mm',
+                                   locale='en_US', tzinfo=tz,
+                                   nonexistent='shift_forward')
+    backward = dates.parse_datetime('2024-03-10 02:30', 'yyyy-MM-dd HH:mm',
+                                    locale='en_US', tzinfo=tz,
+                                    nonexistent='shift_backward')
+    assert forward.replace(tzinfo=None) == datetime(2024, 3, 10, 3, 30)
+    assert forward.utcoffset() == timedelta(hours=-4)
+    assert backward.replace(tzinfo=None) == datetime(2024, 3, 10, 1, 30)
+    assert backward.utcoffset() == timedelta(hours=-5)
+
+
+def test_parse_datetime_tzinfo_normal_local_time():
+    tz = dates.get_timezone('America/New_York')
+    parsed = dates.parse_datetime('2024-06-01 12:00', 'yyyy-MM-dd HH:mm',
+                                  locale='en_US', tzinfo=tz)
+    assert parsed.utcoffset() == timedelta(hours=-4)
+    # A timezone name may be passed instead of a tzinfo object:
+    parsed = dates.parse_datetime('2024-06-01 12:00', 'yyyy-MM-dd HH:mm',
+                                  locale='en_US', tzinfo='UTC')
+    assert parsed.utcoffset() == timedelta(0)
+
+
+def test_parse_datetime_invalid_dst_policy():
+    with pytest.raises(ValueError, match='ambiguous'):
+        dates.parse_datetime('2024-06-01', 'yyyy-MM-dd', locale='en_US',
+                             tzinfo=UTC, ambiguous='whatever')
+    with pytest.raises(ValueError, match='nonexistent'):
+        dates.parse_datetime('2024-06-01', 'yyyy-MM-dd', locale='en_US',
+                             tzinfo=UTC, nonexistent='whatever')
+
+
 def test_datetime_format_get_week_number():
     format = dates.DateTimeFormat(date(2006, 1, 8), Locale.parse('de_DE'))
     assert format.get_week_number(6) == 1
